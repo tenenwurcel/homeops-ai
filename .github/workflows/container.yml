@@ -43,5 +43,13 @@ jobs:
           tags: ${{ steps.metadata.outputs.tags }}
           labels: ${{ steps.metadata.outputs.labels }}
 
+      - uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ghcr.io/${{ github.repository_owner }}/homeops-ai@${{ steps.build.outputs.digest }}
+          scanners: vuln,secret
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: 1
+
       - name: Record immutable image reference
         run: echo "ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/homeops-ai@${{ steps.build.outputs.digest }}" >> "$GITHUB_STEP_SUMMARY"
