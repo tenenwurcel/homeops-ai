@@ -1,0 +1,17 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Derived local database state
+data/
+
+# Test and tool caches
+.pytest_cache/
+__pycache__/

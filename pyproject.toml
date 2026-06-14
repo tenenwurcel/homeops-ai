@@ -1,0 +1,26 @@
+[project]
+name = "homeops-ai"
+version = "0.1.0"
+description = "Evidence-backed HomeOps knowledge platform"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "markdown-it-py>=4,<5",
+    "pycozo[embedded]==0.7.6",
+    "ruamel-yaml>=0.18,<0.19",
+]
+
+[project.scripts]
+homeops-ai = "homeops_ai.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.9.30,<0.10.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3,<9",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
