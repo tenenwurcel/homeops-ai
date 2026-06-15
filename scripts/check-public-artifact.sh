@@ -11,6 +11,7 @@ files=(
   src
   tests
   deploy
+  evaluation
   scripts
 )
 

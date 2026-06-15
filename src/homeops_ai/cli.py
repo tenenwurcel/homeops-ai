@@ -12,6 +12,16 @@ from homeops_ai.build import (
     verify_run,
 )
 from homeops_ai.database import run_smoke_test
+from homeops_ai.context_compiler import (
+    ContextCompilerError,
+    compile_context,
+    write_bundle,
+)
+from homeops_ai.evaluation import (
+    EvaluationError,
+    evaluate_suite,
+    write_report as write_evaluation_report,
+)
 from homeops_ai.migration import (
     MigrationError,
     apply_migration,
@@ -20,6 +30,19 @@ from homeops_ai.migration import (
     write_report,
 )
 from homeops_ai.source_contract import discover_sources, export_snapshot
+from homeops_ai.query import QueryError, execute_query, query_names
+
+
+def _parameters(values: list[str]) -> dict[str, str]:
+    parameters = {}
+    for value in values:
+        if "=" not in value:
+            raise QueryError(f"query parameter must use key=value syntax: {value}")
+        key, parameter = value.split("=", 1)
+        if not key or key in parameters:
+            raise QueryError(f"invalid or duplicate query parameter: {key}")
+        parameters[key] = parameter
+    return parameters
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -105,6 +128,36 @@ def build_parser() -> argparse.ArgumentParser:
     )
     cleanup_parser.add_argument("--data-dir", type=Path, default=Path("data"))
     cleanup_parser.add_argument("--failed", action="store_true", required=True)
+
+    query = subparsers.add_parser("query", help="run a stable read-only knowledge query")
+    query.add_argument("name", choices=query_names())
+    query.add_argument("--data-dir", type=Path, default=Path("data"))
+    query.add_argument("--run-id")
+    query.add_argument("--param", action="append", default=[], metavar="KEY=VALUE")
+
+    evaluate = subparsers.add_parser("evaluate", help="run a versioned evaluation suite")
+    evaluate.add_argument(
+        "--cases",
+        type=Path,
+        default=Path("evaluation/deterministic-homeops-v1.yaml"),
+    )
+    evaluate.add_argument("--data-dir", type=Path, default=Path("data"))
+    evaluate.add_argument("--run-id")
+    evaluate.add_argument("--output", type=Path, required=True)
+
+    context = subparsers.add_parser("context", help="compile trustworthy evidence bundles")
+    context_subparsers = context.add_subparsers(dest="context_command", required=True)
+    compile_parser = context_subparsers.add_parser(
+        "compile", help="compile a deterministic context bundle"
+    )
+    compile_parser.add_argument("--question", required=True)
+    compile_parser.add_argument("--risk", choices=("normal", "risky"), required=True)
+    compile_parser.add_argument("--max-documents", type=int, default=5)
+    compile_parser.add_argument("--max-sections", type=int, default=8)
+    compile_parser.add_argument("--max-chars", type=int, default=6000)
+    compile_parser.add_argument("--data-dir", type=Path, default=Path("data"))
+    compile_parser.add_argument("--run-id")
+    compile_parser.add_argument("--output", type=Path)
 
     return parser
 
@@ -214,4 +267,67 @@ def main() -> None:
             print(json.dumps(result, indent=2))
             return
         except (BuildError, OSError, ValueError) as error:
+            raise SystemExit(str(error)) from error
+
+    if args.command == "query":
+        try:
+            result = execute_query(
+                args.data_dir,
+                args.name,
+                _parameters(args.param),
+                run_id=args.run_id,
+            )
+            print(json.dumps(result, indent=2))
+            return
+        except (QueryError, OSError, ValueError) as error:
+            raise SystemExit(str(error)) from error
+
+    if args.command == "evaluate":
+        try:
+            report = evaluate_suite(args.cases, args.data_dir, run_id=args.run_id)
+            write_evaluation_report(report, args.output)
+            print(
+                json.dumps(
+                    {
+                        "output": str(args.output.resolve()),
+                        **report["summary"],
+                        "suite_passed": report["passed"],
+                    },
+                    indent=2,
+                )
+            )
+            if not report["passed"]:
+                raise SystemExit(2)
+            return
+        except (EvaluationError, QueryError, OSError, ValueError) as error:
+            raise SystemExit(str(error)) from error
+
+    if args.command == "context" and args.context_command == "compile":
+        try:
+            bundle = compile_context(
+                args.data_dir,
+                args.question,
+                risk_level=args.risk,
+                max_documents=args.max_documents,
+                max_sections=args.max_sections,
+                max_chars=args.max_chars,
+                run_id=args.run_id,
+            )
+            if args.output:
+                write_bundle(bundle, args.output)
+                print(
+                    json.dumps(
+                        {
+                            "output": str(args.output.resolve()),
+                            "run_id": bundle["build"]["run_id"],
+                            **bundle["selection"],
+                            "live_verification_required": bundle["live_verification"]["required"],
+                        },
+                        indent=2,
+                    )
+                )
+            else:
+                print(json.dumps(bundle, indent=2))
+            return
+        except (ContextCompilerError, OSError, ValueError) as error:
             raise SystemExit(str(error)) from error

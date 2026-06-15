@@ -1,0 +1,39 @@
+schema_version: 1
+suite_id: context-compiler-v1
+suite_version: 1
+cases:
+  - id: risky-heavy-vm-change
+    question: Prepare the smallest trustworthy context bundle for changing the Heavy VM.
+    capability_class: context-compiler
+    compile:
+      question: Prepare the smallest trustworthy context bundle for changing the Heavy VM.
+      risk_level: risky
+      max_documents: 5
+      max_sections: 8
+      max_chars: 6000
+    expected:
+      required_source_paths: [Heavy VM.md, Homelab Current State.md]
+      forbidden_statuses: [historical, superseded, abandoned]
+      live_verification_required: true
+      max_document_count: 3
+      max_section_count: 4
+      max_evidence_chars: 2500
+    reviewer_notes: Risky mutation context must remain small and require fresh discovery.
+
+  - id: normal-heavy-vm-current-state
+    question: What currently runs on the Heavy VM?
+    capability_class: context-compiler
+    compile:
+      question: What currently runs on the Heavy VM?
+      risk_level: normal
+      max_documents: 4
+      max_sections: 5
+      max_chars: 4000
+    expected:
+      required_source_paths: [Heavy VM.md, Homelab Current State.md]
+      forbidden_statuses: [historical, superseded, abandoned]
+      live_verification_required: false
+      max_document_count: 3
+      max_section_count: 4
+      max_evidence_chars: 2500
+    reviewer_notes: Normal current-state context must remain deterministic and concise.

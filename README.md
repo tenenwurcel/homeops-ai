@@ -72,6 +72,45 @@ HomeOps closes the database, verifies it through a constrained separate process,
 then atomically updates `data/active.json`. An unchanged source and artifact
 fingerprint does not create another build unless `--force` is used.
 
+## Deterministic Queries And Evaluation
+
+Stable read-only queries run against the active verified build:
+
+```bash
+uv run homeops-ai query canonical-current
+uv run homeops-ai query links-to --param 'title=Heavy VM'
+uv run homeops-ai query context --param 'question=What currently runs here?'
+```
+
+The versioned evaluation suite separates graph correctness, deterministic
+context usefulness, and expected capability gaps. Generated reports remain
+derived local state under `data/`:
+
+```bash
+uv run homeops-ai evaluate \
+  --cases evaluation/deterministic-homeops-v1.yaml \
+  --output data/evaluation/deterministic-homeops-v1.json
+```
+
+Compile exact evidence sections into a deterministic, budgeted context bundle.
+Risk is explicit; risky bundles always require fresh live discovery before
+mutation:
+
+```bash
+uv run homeops-ai context compile \
+  --question 'Prepare context for changing the Heavy VM' \
+  --risk risky \
+  --output data/context/heavy-vm-change.json
+```
+
+Evaluate the versioned context-compiler contract:
+
+```bash
+uv run homeops-ai evaluate \
+  --cases evaluation/context-compiler-v1.yaml \
+  --output data/evaluation/context-compiler-v1.json
+```
+
 ## NixOS Host Deployment
 
 Export a deployment snapshot before synchronizing the vault to a NixOS host:

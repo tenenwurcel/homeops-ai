@@ -14,6 +14,7 @@ RUN pip install --no-cache-dir uv==0.9.30
 WORKDIR /app
 COPY README.md pyproject.toml uv.lock ./
 COPY src ./src
+COPY evaluation ./evaluation
 RUN uv sync --frozen --no-dev --no-editable \
     && rm -rf /root/.cache/uv
 

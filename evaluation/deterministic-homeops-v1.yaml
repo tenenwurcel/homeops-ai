@@ -1,0 +1,214 @@
+schema_version: 1
+suite_id: deterministic-homeops-v1
+suite_version: 1
+cases:
+  - id: graph-canonical-current
+    question: Which documents are canonical and current?
+    capability_class: deterministic-graph
+    query:
+      name: canonical-current
+    expected:
+      min_rows: 5
+      required_source_paths:
+        - AI Context.md
+        - Network Current State.md
+        - Smarthome Current State.md
+        - Homelab Current State.md
+        - HomeOps Current State.md
+      forbidden_statuses: [historical, superseded, abandoned]
+    live_verification_required: false
+    reviewer_notes: Canonical current-state documents must remain directly discoverable.
+
+  - id: graph-direct-links-heavy-vm
+    question: Which notes directly link to Heavy VM?
+    capability_class: deterministic-graph
+    query:
+      name: links-to
+      params:
+        title: Heavy VM
+    expected:
+      min_rows: 4
+      required_source_paths: [HomeOps Current State.md]
+    live_verification_required: false
+    reviewer_notes: Direct backlinks are deterministic evidence, not semantic matches.
+
+  - id: graph-reachable-ai-context
+    question: Which documents are recursively reachable from AI Context?
+    capability_class: deterministic-graph
+    query:
+      name: reachable-from
+      params:
+        title: AI Context
+    expected:
+      min_rows: 40
+      required_source_paths: [AI Context.md, HomeOps Current State.md]
+    live_verification_required: false
+    reviewer_notes: The context entry point should reach the high-value knowledge graph.
+
+  - id: graph-link-inventory
+    question: Which links are unresolved, ambiguous, excluded, external, or attachments?
+    capability_class: deterministic-graph
+    query:
+      name: link-inventory
+    expected:
+      min_rows: 800
+      summary_equals:
+        by_resolution_state.unresolved: 197
+        by_resolution_state.ambiguous: 0
+    live_verification_required: false
+    reviewer_notes: The unresolved-link baseline is intentional and reviewed separately.
+
+  - id: graph-missing-lifecycle
+    question: Which eligible documents lack lifecycle metadata?
+    capability_class: deterministic-graph
+    query:
+      name: missing-lifecycle
+    expected:
+      row_count: 0
+    live_verification_required: false
+    reviewer_notes: All currently approved knowledge sources have lifecycle metadata.
+
+  - id: graph-guidance-conflicts
+    question: Which historical or superseded documents could conflict with current guidance?
+    capability_class: deterministic-graph
+    query:
+      name: guidance-conflicts
+    expected:
+      max_rows: 10
+    live_verification_required: false
+    reviewer_notes: Review candidates are graph-connected to canonical current guidance.
+
+  - id: context-home-assistant-location
+    question: Where is Home Assistant currently running, and what external services does it depend on?
+    capability_class: context-retrieval
+    query:
+      name: context
+      params:
+        question: Where is Home Assistant currently running, and what external services does it depend on?
+        limit: "5"
+    expected:
+      required_source_paths: [Smarthome Current State.md]
+      forbidden_statuses: [historical, superseded, abandoned]
+    failure_classification: retrieval-policy
+    live_verification_required: false
+    reviewer_notes: Current canonical state should outrank historical implementation records.
+
+  - id: context-heavy-vm-services
+    question: What currently runs on the Heavy VM?
+    capability_class: context-retrieval
+    query:
+      name: context
+      params:
+        question: What currently runs on the Heavy VM?
+        limit: "5"
+    expected:
+      required_source_paths: [Heavy VM.md]
+      forbidden_statuses: [historical, superseded, abandoned]
+    failure_classification: retrieval-policy
+    live_verification_required: false
+    reviewer_notes: The Heavy VM anchor should be the primary evidence document.
+
+  - id: context-network-spine
+    question: What is the verified network spine topology?
+    capability_class: context-retrieval
+    query:
+      name: context
+      params:
+        question: What is the verified network spine topology?
+        limit: "5"
+    expected:
+      required_source_paths: [Network Current State.md]
+      forbidden_statuses: [historical, superseded, abandoned]
+    failure_classification: retrieval-policy
+    live_verification_required: false
+    reviewer_notes: Verified canonical network state should be retrieved.
+
+  - id: context-unimplemented-vlan
+    question: Which VLAN is not implemented?
+    capability_class: context-retrieval
+    query:
+      name: context
+      params:
+        question: Which VLAN is not implemented?
+        limit: "5"
+    expected:
+      required_source_paths: [Network Current State.md]
+      forbidden_statuses: [historical, superseded, abandoned]
+    failure_classification: retrieval-policy
+    live_verification_required: false
+    reviewer_notes: Exact deterministic wording should find the canonical state.
+
+  - id: context-network-review-items
+    question: Which current network review items require user verification before changes?
+    capability_class: context-retrieval
+    query:
+      name: context
+      params:
+        question: Which current network review items require user verification before changes?
+        limit: "5"
+    expected:
+      required_source_paths: [AI Context.md]
+      forbidden_statuses: [historical, superseded, abandoned]
+    failure_classification: retrieval-policy
+    live_verification_required: false
+    reviewer_notes: Known verification gaps belong in the canonical AI context entry point.
+
+  - id: context-active-ai-priorities
+    question: What active plans and priorities relate to AI-assisted smart-home work?
+    capability_class: context-retrieval
+    query:
+      name: context
+      params:
+        question: What active plans and priorities relate to AI-assisted smart-home work?
+        limit: "5"
+    expected:
+      required_source_paths: [AI Context.md]
+      forbidden_statuses: [historical, superseded, abandoned]
+    failure_classification: retrieval-policy
+    live_verification_required: false
+    reviewer_notes: Current priorities should be found without embeddings.
+
+  - id: gap-live-device-on-switch-port
+    question: What device is currently connected to CRS310 ether6?
+    capability_class: expected-gap
+    expected_gap:
+      classification: live-read-only-collectors
+      reason: Current switch-port state is absent from authoritative Markdown.
+    live_verification_required: true
+    reviewer_notes: Requires safe live discovery or user-provided output.
+
+  - id: gap-normalized-infrastructure-entities
+    question: Which IP addresses refer to the same infrastructure entity across all notes?
+    capability_class: expected-gap
+    expected_gap:
+      classification: structured-entities-and-claims
+      reason: Identity normalization and provenance are not represented yet.
+    live_verification_required: false
+    reviewer_notes: Do not infer entity identity from strings alone.
+
+  - id: gap-conceptual-service-isolation
+    question: Find notes conceptually related to service isolation even when they do not link to each other.
+    capability_class: expected-gap
+    expected_gap:
+      classification: embeddings-vector-retrieval
+      reason: Deterministic links and exact words cannot establish conceptual similarity.
+    live_verification_required: false
+    reviewer_notes: Full-text search should be considered before embeddings if exact words suffice.
+
+  - id: gap-heavy-vm-context-bundle
+    question: Prepare the smallest trustworthy context bundle for changing the Heavy VM.
+    capability_class: expected-gap
+    expected_gap:
+      classification: context-compiler
+      reason: Evidence selection and context budgeting are not implemented yet.
+    live_verification_required: true
+    reviewer_notes: Risky changes also require fresh operational discovery.
+
+  - id: gap-external-ai-access
+    question: Allow Codex or Claude to query HomeOps directly.
+    capability_class: expected-gap
+    expected_gap:
+      classification: read-only-mcp
+      reason: HomeOps exposes no network or agent-facing query interface.
+    live_verification_required: false
+    reviewer_notes: Add only after local retrieval quality is measured and approved.
