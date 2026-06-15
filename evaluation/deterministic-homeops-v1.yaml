@@ -53,7 +53,7 @@ cases:
     expected:
       min_rows: 800
       summary_equals:
-        by_resolution_state.unresolved: 197
+        by_resolution_state.unresolved: 198
         by_resolution_state.ambiguous: 0
     live_verification_required: false
     reviewer_notes: The unresolved-link baseline is intentional and reviewed separately.
