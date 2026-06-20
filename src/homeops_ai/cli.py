@@ -159,11 +159,21 @@ def build_parser() -> argparse.ArgumentParser:
     compile_parser.add_argument("--run-id")
     compile_parser.add_argument("--output", type=Path)
 
+    mcp = subparsers.add_parser("mcp", help="run the read-only MCP server")
+    mcp.add_argument("--data-dir", type=Path, default=Path("data"))
+    mcp.add_argument("--transport", choices=("stdio",), default="stdio")
+
     return parser
 
 
 def main() -> None:
     args = build_parser().parse_args()
+
+    if args.command == "mcp":
+        from homeops_ai.mcp_server import create_server
+
+        create_server(args.data_dir).run(transport=args.transport)
+        return
 
     if args.command == "smoke":
         if args.database is not None:

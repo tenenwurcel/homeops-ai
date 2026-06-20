@@ -6,12 +6,14 @@ readme = "README.md"
 requires-python = ">=3.12,<3.13"
 dependencies = [
     "markdown-it-py>=4,<5",
+    "mcp>=1.27,<2",
     "pycozo[embedded]==0.7.6",
     "ruamel-yaml>=0.18,<0.19",
 ]
 
 [project.scripts]
 homeops-ai = "homeops_ai.cli:main"
+homeops-ai-mcp = "homeops_ai.mcp_server:main"
 
 [build-system]
 requires = ["uv_build>=0.9.30,<0.10.0"]

@@ -111,6 +111,32 @@ uv run homeops-ai evaluate \
   --output data/evaluation/context-compiler-v1.json
 ```
 
+## Read-Only MCP Server
+
+HomeOps can expose the verified build through a stdio MCP server. The server
+does not listen on a network socket and all tools call the existing stable
+read-only query and context-compiler APIs.
+
+```bash
+uv run homeops-ai-mcp --data-dir data
+```
+
+The same server is also available through the main CLI, which is useful for the
+container image because its entrypoint is `homeops-ai`:
+
+```bash
+uv run homeops-ai mcp --data-dir data
+```
+
+The MCP surface is intentionally small:
+
+- `build_status`: active verified build metadata, counts, validation, and
+  available stable queries.
+- `query`: one stable read-only query by name, with string parameters and a
+  bounded row count.
+- `context_bundle`: deterministic evidence bundle compilation. Risk is explicit;
+  risky bundles still require fresh live read-only discovery before mutation.
+
 ## NixOS Host Deployment
 
 Export a deployment snapshot before synchronizing the vault to a NixOS host:
