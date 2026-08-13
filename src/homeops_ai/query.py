@@ -1,11 +1,15 @@
-import json
 import re
 from collections import Counter, defaultdict, deque
 from pathlib import Path
 from typing import Any, Callable
 
-from homeops_ai.build import active_state
 from homeops_ai.database import open_database
+from homeops_ai.deployment import (
+    DeploymentError,
+    deployment_for_run,
+    provenance,
+    strict_json_loads,
+)
 
 
 FORBIDDEN_GUIDANCE_STATUSES = {"historical", "superseded", "abandoned"}
@@ -42,20 +46,39 @@ class QueryError(RuntimeError):
 
 
 def _load_json(path: Path) -> dict[str, Any]:
-    return json.loads(path.read_text(encoding="utf-8"))
+    parsed = strict_json_loads(path.read_text(encoding="utf-8"))
+    if not isinstance(parsed, dict):
+        raise QueryError(f"JSON document is not an object: {path}")
+    return parsed
 
 
 def build_manifest(data_dir: Path, run_id: str | None = None) -> dict[str, Any]:
     data = data_dir.resolve()
-    selected = run_id or active_state(data).get("current")
-    if not selected:
-        raise QueryError("there is no active build to query")
+    try:
+        deployment, role, selected = deployment_for_run(data, run_id)
+    except DeploymentError as error:
+        raise QueryError(str(error)) from error
     path = data / "builds" / selected / "manifest.json"
     if not path.is_file():
         raise QueryError(f"build manifest does not exist: {path}")
     manifest = _load_json(path)
     if manifest.get("result") != "verified":
         raise QueryError(f"build is not verified: {selected}")
+    if manifest.get("run_id") != selected:
+        raise QueryError("build manifest run ID does not match selected directory")
+    safe_database = (data / "builds" / selected / "cozo.db").resolve()
+    if not safe_database.is_relative_to((data / "builds").resolve()):
+        raise QueryError("selected database path escapes builds directory")
+    if deployment is not None:
+        for field in (
+            "source_fingerprint",
+            "artifact_fingerprint",
+            "logical_fingerprint",
+        ):
+            if manifest.get(field) != deployment[field]:
+                raise QueryError(f"build/deployment {field} mismatch")
+    manifest["_database_path"] = str(safe_database)
+    manifest["_deployment_provenance"] = provenance(deployment, role, selected)
     return manifest
 
 
@@ -385,11 +408,12 @@ def execute_query(
     if name not in QUERY_HANDLERS:
         raise QueryError(f"unknown query {name!r}; choose from: {', '.join(query_names())}")
     manifest = build_manifest(data_dir, run_id)
-    with open_database(Path(manifest["database_path"])) as client:
+    with open_database(Path(manifest["_database_path"])) as client:
         result = QUERY_HANDLERS[name](client, params or {})
     return {
         "schema_version": 1,
         "run_id": manifest["run_id"],
+        "deployment": manifest["_deployment_provenance"],
         "query": name,
         "parameters": params or {},
         **result,

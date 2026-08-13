@@ -4,5 +4,8 @@
 .venv
 data
 deploy
+cmd
+internal
+go.mod
 scripts
 tests

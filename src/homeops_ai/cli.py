@@ -1,11 +1,15 @@
 import argparse
 import json
+import os
 from pathlib import Path
 
 from homeops_ai.build import (
     BuildError,
+    adopt_legacy_state,
     cleanup_failed,
+    evaluate_candidate,
     list_builds,
+    promote,
     rebuild,
     rollback,
     validation_report,
@@ -31,6 +35,43 @@ from homeops_ai.migration import (
 )
 from homeops_ai.source_contract import discover_sources, export_snapshot
 from homeops_ai.query import QueryError, execute_query, query_names
+from homeops_ai.deployment import DeploymentError
+from homeops_ai.pipeline import (
+    DEFAULT_PUBLISHER_ID,
+    PipelineError,
+    SSHTransport,
+    process_remote,
+    publish_current_status,
+    reconcile,
+    verify_active,
+)
+from homeops_ai.snapshot import SnapshotError
+
+
+_PIPELINE_FAILURE_OUTCOMES = {
+    "LOCAL_VAULT_INVALID",
+    "LOCAL_SOURCE_CHANGED",
+    "PROMOTED_SOURCE_MOVED",
+    "AUTHORIZATION_FAILED",
+    "TRANSFER_FAILED",
+    "REMOTE_SNAPSHOT_INVALID",
+    "BUILD_FAILED",
+    "EVALUATION_FAILED",
+    "PROMOTION_CONFLICT",
+    "POST_PROMOTION_MISMATCH",
+    "HOMEOPS_UNAVAILABLE",
+    "TIMEOUT",
+    "INTERNAL_ERROR",
+}
+
+
+def _pipeline_result_failed(result: dict[str, object]) -> bool:
+    if result.get("outcome") in _PIPELINE_FAILURE_OUTCOMES:
+        return True
+    outcomes = result.get("outcomes")
+    return isinstance(outcomes, list) and any(
+        outcome in _PIPELINE_FAILURE_OUTCOMES for outcome in outcomes
+    )
 
 
 def _parameters(values: list[str]) -> dict[str, str]:
@@ -123,6 +164,28 @@ def build_parser() -> argparse.ArgumentParser:
     )
     rollback_parser.add_argument("--data-dir", type=Path, default=Path("data"))
 
+    adopt_parser = database_subparsers.add_parser(
+        "adopt-legacy",
+        help="adopt a verified schema-v1 build and its actual immutable snapshot",
+    )
+    adopt_parser.add_argument("--data-dir", type=Path, default=Path("data"))
+    adopt_parser.add_argument("--current-vault", type=Path, required=True)
+    adopt_parser.add_argument("--previous-vault", type=Path)
+
+    promote_parser = database_subparsers.add_parser(
+        "promote", help="guardedly select an evaluated schema-v2 deployment"
+    )
+    promote_parser.add_argument("--data-dir", type=Path, default=Path("data"))
+    promote_parser.add_argument("--deployment", type=Path, required=True)
+    promote_parser.add_argument("--expected-current-deployment-id")
+
+    candidate_evaluate_parser = database_subparsers.add_parser(
+        "evaluate-candidate", help="run promotion-safe checks against an explicit run"
+    )
+    candidate_evaluate_parser.add_argument("--data-dir", type=Path, default=Path("data"))
+    candidate_evaluate_parser.add_argument("--run-id", required=True)
+    candidate_evaluate_parser.add_argument("--cases", type=Path, action="append", default=[])
+
     cleanup_parser = database_subparsers.add_parser(
         "cleanup", help="remove database directories for failed builds"
     )
@@ -163,6 +226,53 @@ def build_parser() -> argparse.ArgumentParser:
     mcp.add_argument("--data-dir", type=Path, default=Path("data"))
     mcp.add_argument("--transport", choices=("stdio",), default="stdio")
 
+    pipeline = subparsers.add_parser(
+        "pipeline", help="coordinate or process transactional snapshot deployments"
+    )
+    pipeline_subparsers = pipeline.add_subparsers(
+        dest="pipeline_command", required=True
+    )
+    reconcile_parser = pipeline_subparsers.add_parser(
+        "reconcile", help="publish one local vault candidate over restricted SSH"
+    )
+    reconcile_parser.add_argument("--vault", type=Path, required=True)
+    reconcile_parser.add_argument("--state-dir", type=Path, required=True)
+    reconcile_parser.add_argument("--target", required=True)
+    reconcile_parser.add_argument("--identity-file", type=Path, required=True)
+    reconcile_parser.add_argument("--known-hosts", type=Path, required=True)
+    reconcile_parser.add_argument("--control-socket", type=Path, required=True)
+    reconcile_parser.add_argument("--publisher-id", default=DEFAULT_PUBLISHER_ID)
+    reconcile_parser.add_argument(
+        "--source-revision", default=os.environ.get("HOMEOPS_SOURCE_REVISION")
+    )
+    reconcile_parser.add_argument(
+        "--image-digest", default=os.environ.get("HOMEOPS_IMAGE_DIGEST")
+    )
+    reconcile_parser.add_argument("--timeout-seconds", type=int, default=900)
+
+    process_parser = pipeline_subparsers.add_parser(
+        "process", help="process immutable incoming candidates and commit markers"
+    )
+    process_parser.add_argument("--root", type=Path, required=True)
+    process_parser.add_argument("--publisher-id", default=DEFAULT_PUBLISHER_ID)
+    process_parser.add_argument("--evaluation", type=Path, action="append", default=[])
+    process_parser.add_argument(
+        "--source-revision", default=os.environ.get("HOMEOPS_SOURCE_REVISION")
+    )
+    process_parser.add_argument(
+        "--image-digest", default=os.environ.get("HOMEOPS_IMAGE_DIGEST")
+    )
+
+    verify_active_parser = pipeline_subparsers.add_parser(
+        "verify-active", help="verify the exact active snapshot/database pair"
+    )
+    verify_active_parser.add_argument("--root", type=Path, required=True)
+
+    publish_current_parser = pipeline_subparsers.add_parser(
+        "publish-current", help="publish redacted current deployment identity"
+    )
+    publish_current_parser.add_argument("--root", type=Path, required=True)
+
     return parser
 
 
@@ -181,6 +291,52 @@ def main() -> None:
         rows = run_smoke_test(args.database)
         print(f"CozoDB smoke test passed: {rows}")
         return
+
+    if args.command == "pipeline":
+        try:
+            if args.pipeline_command == "reconcile":
+                transport = SSHTransport(
+                    target=args.target,
+                    identity_file=args.identity_file,
+                    known_hosts=args.known_hosts,
+                    control_socket=args.control_socket,
+                )
+                result = reconcile(
+                    vault=args.vault,
+                    state_dir=args.state_dir,
+                    transport=transport,
+                    publisher_id=args.publisher_id,
+                    source_revision=args.source_revision,
+                    image_digest=args.image_digest,
+                    timeout_seconds=args.timeout_seconds,
+                )
+            elif args.pipeline_command == "process":
+                result = process_remote(
+                    args.root,
+                    publisher_id=args.publisher_id,
+                    evaluation_cases=args.evaluation,
+                    source_revision=args.source_revision,
+                    image_digest=args.image_digest,
+                )
+            elif args.pipeline_command == "verify-active":
+                result = verify_active(args.root)
+            elif args.pipeline_command == "publish-current":
+                result = publish_current_status(args.root)
+            else:
+                raise PipelineError("INTERNAL_ERROR", "unsupported pipeline command")
+            print(json.dumps(result, indent=2))
+            if _pipeline_result_failed(result):
+                raise SystemExit(2)
+            return
+        except (
+            PipelineError,
+            BuildError,
+            DeploymentError,
+            SnapshotError,
+            OSError,
+            ValueError,
+        ) as error:
+            raise SystemExit(str(error)) from error
 
     if args.command == "vault" and args.vault_command == "inventory":
         sources = discover_sources(
@@ -270,6 +426,27 @@ def main() -> None:
                 result = {"builds": list_builds(args.data_dir)}
             elif args.database_command == "rollback":
                 result = rollback(args.data_dir)
+                if result.get("schema_version") == 2:
+                    publish_current_status(args.data_dir.resolve().parent)
+            elif args.database_command == "adopt-legacy":
+                result = adopt_legacy_state(
+                    args.data_dir,
+                    args.current_vault,
+                    previous_vault=args.previous_vault,
+                )
+                publish_current_status(args.data_dir.resolve().parent)
+            elif args.database_command == "promote":
+                deployment = json.loads(args.deployment.read_text(encoding="utf-8"))
+                result = promote(
+                    args.data_dir,
+                    deployment,
+                    expected_current_deployment_id=args.expected_current_deployment_id,
+                )
+                publish_current_status(args.data_dir.resolve().parent)
+            elif args.database_command == "evaluate-candidate":
+                result = evaluate_candidate(
+                    args.data_dir, args.run_id, cases=args.cases
+                )
             elif args.database_command == "cleanup":
                 result = {"cleaned_failed_builds": cleanup_failed(args.data_dir)}
             else:

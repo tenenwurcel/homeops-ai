@@ -62,8 +62,9 @@ def get_build_status(data_dir: Path, run_id: str | None = None) -> dict[str, Any
 
         validation = json.loads(validation_path.read_text(encoding="utf-8"))
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "run_id": manifest["run_id"],
+        "deployment": manifest["_deployment_provenance"],
         "active": active_state(data_dir.resolve()),
         "result": manifest["result"],
         "profile": manifest["profile"],

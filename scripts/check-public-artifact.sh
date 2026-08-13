@@ -6,8 +6,11 @@ files=(
   .github
   Containerfile
   README.md
+  go.mod
   pyproject.toml
   uv.lock
+  cmd
+  internal
   src
   tests
   deploy
@@ -23,6 +26,7 @@ patterns=(
   '(^|[^[:digit:]])192\.168\.[[:digit:]]{1,3}\.[[:digit:]]{1,3}([^[:digit:]]|$)'
   '(^|[^[:digit:]])172\.(1[6-9]|2[0-9]|3[01])\.[[:digit:]]{1,3}\.[[:digit:]]{1,3}([^[:digit:]]|$)'
   '/home/[^/[:space:]]+'
+  '(^|[^[:alnum:]_])(mynix|htenew)([^[:alnum:]_]|$)'
 )
 
 failed=0

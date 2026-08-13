@@ -8,6 +8,9 @@ ENV PATH="/app/.venv/bin:${PATH}" \
 
 RUN apt-get update \
     && apt-get upgrade -y \
+    && apt-get install --no-install-recommends -y openssh-client \
+    && groupadd --gid 65532 homeops \
+    && useradd --uid 65532 --gid 65532 --home-dir /var/lib/homeops-client --create-home --shell /usr/sbin/nologin homeops \
     && rm -rf /var/lib/apt/lists/*
 RUN pip install --no-cache-dir uv==0.9.30
 

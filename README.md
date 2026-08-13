@@ -14,6 +14,9 @@ and does not promise API, syntax, or storage compatibility.
 ```bash
 uv sync
 uv run pytest
+go test ./...
+go test -race ./...
+go vet ./...
 uv run homeops-ai smoke
 uv run homeops-ai smoke --database data/homeops.db
 ```
@@ -137,36 +140,40 @@ The MCP surface is intentionally small:
 - `context_bundle`: deterministic evidence bundle compilation. Risk is explicit;
   risky bundles still require fresh live read-only discovery before mutation.
 
-## NixOS Host Deployment
+## Automatic Transactional Pipeline
 
-Export a deployment snapshot before synchronizing the vault to a NixOS host:
+The workstation-side NixOS timer runs once after startup and then every 30
+minutes. Each run takes a local lock, validates and snapshots the vault, and
+asks the host for its redacted current deployment identity. Matching content,
+source revision, package version, immutable runtime image digest, and build
+contracts finish as `UNCHANGED` without transferring or rebuilding anything.
 
-```bash
-uv run homeops-ai vault snapshot \
-  --vault /path/to/vault \
-  --output /tmp/homeops-vault-snapshot
-```
+Changed snapshots travel through a dedicated, multiplexed SSH connection. The
+key is restricted to four exact forced-command receiver verbs; client-supplied
+shell commands, arguments, PTYs, forwarding, and direct spool access are not
+available. The Go receiver validates a bounded deterministic USTAR stream,
+removes the raw request capability, and atomically publishes an immutable
+request for the unprivileged processor.
 
-The snapshot contains exact bytes for approved root and `Categories/` Markdown
-sources. Other vault files are represented only by empty path placeholders so
-link-resolution inventory remains deterministic without copying hidden, trash,
-template, or artifact contents. The deployed container binds the promoted
-snapshot read-only and stores reproducible Cozo builds under
-`/var/lib/homeops-ai/data`.
+The host processor independently verifies the snapshot and receipt, builds a
+new immutable Cozo candidate, and runs `evaluation/promotion-safe-v1.yaml`.
+Only a passing candidate is reported as ready. The workstation verifies that
+its source has not moved and sends a compare-and-swap commit; the host then
+atomically selects the deployment and publishes the exact redacted identity
+used by later preflight checks. Failed validation, transfer, build, evaluation,
+or CAS leaves the active database untouched, and the workstation records the
+bounded result for diagnostics.
 
-After the NixOS service is installed, synchronize and promote a
-validated snapshot with:
+The runtime container includes the Python coordinator/processor and OpenSSH
+client. The privileged forced-command receiver is deliberately separate: Nix
+builds `./cmd/homeops-receiver` from the same tagged source with
+`buildGoModule`, installs an immutable wrapper with fixed paths and identities,
+and grants the publisher no filesystem access to pipeline spools. The MCP
+service resolves only the atomically selected, verified Cozo deployment.
 
-```bash
-HOMEOPS_TARGET=ssh-user@nixos-host \
-  deploy/nixos-host/sync-snapshot.sh /path/to/vault
-```
-
-The NixOS path unit starts a constrained rebuild when the script updates the
-snapshot symlink and touches `/var/lib/homeops-ai/rebuild-request`. A daily
-timer also verifies restart and unchanged-input behavior.
-
-Tagged releases and manually dispatched runs publish the reviewed `Containerfile`
-to GHCR through `.github/workflows/container.yml`. The NixOS configuration
-must reference the resulting immutable `ghcr.io/<owner>/homeops-ai@sha256:...`
+Tagged releases and manually dispatched runs first run the complete Python and
+Go suites (including the race detector and vet), build the Python and receiver
+artifacts, build and exercise the runtime container, and scan it. Only then does
+`.github/workflows/container.yml` publish to GHCR. The NixOS configuration must
+reference the resulting immutable `ghcr.io/<owner>/homeops-ai@sha256:...`
 digest, never a mutable tag or a manually installed local image ID.

@@ -44,7 +44,7 @@ def _validate_budgets(max_documents: int, max_sections: int, max_chars: int) -> 
 
 
 def _section_bodies(manifest: dict[str, Any]) -> dict[tuple[str, int], str]:
-    with open_database(Path(manifest["database_path"])) as client:
+    with open_database(Path(manifest["_database_path"])) as client:
         rows = client.run(
             "?[document_id, ordinal, body] := *section{document_id, ordinal, body}",
             immutable=True,
@@ -259,7 +259,9 @@ def compile_context(
         "build": {
             "run_id": manifest["run_id"],
             "source_fingerprint": manifest["source_fingerprint"],
+            "artifact_fingerprint": manifest["artifact_fingerprint"],
             "logical_fingerprint": manifest["logical_fingerprint"],
+            "deployment": manifest["_deployment_provenance"],
         },
         "request": {
             "question": question,

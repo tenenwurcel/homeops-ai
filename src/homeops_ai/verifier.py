@@ -12,10 +12,14 @@ def _rows(client: Any, query: str) -> list[list[Any]]:
 
 
 def verify(build_dir: Path) -> dict[str, Any]:
+    build_dir = build_dir.resolve()
     manifest = json.loads((build_dir / "manifest.json").read_text(encoding="utf-8"))
-    database_path = Path(manifest["database_path"])
+    database_path = build_dir / "cozo.db"
     errors: list[str] = []
     checks: dict[str, Any] = {}
+
+    if manifest.get("run_id") != build_dir.name:
+        errors.append("manifest run ID does not match build directory")
 
     with open_database(database_path) as client:
         actual_relations = relation_names(client)

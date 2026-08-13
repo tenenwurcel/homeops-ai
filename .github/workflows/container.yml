@@ -8,22 +8,68 @@ on:
 
 permissions:
   contents: read
-  packages: write
+
+concurrency:
+  group: homeops-container-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  publish:
+  verify:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12.12"
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.9.30"
+          enable-cache: true
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
       - name: Check public artifact privacy
         run: scripts/check-public-artifact.sh
 
-      - uses: docker/login-action@v3
+      - name: Install the locked Python environment
+        run: uv sync --frozen --dev
+
+      - name: Test the Python pipeline
+        run: uv run python -m pytest
+
+      - name: Test and inspect the forced-command receiver
+        run: |
+          go test ./...
+          go test -race ./...
+          go vet ./...
+
+      - name: Build release artifacts
+        run: |
+          mkdir -p release/python
+          uv build --out-dir release/python
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o release/homeops-receiver-linux-amd64 ./cmd/homeops-receiver
+          cd release
+          sha256sum python/* homeops-receiver-linux-amd64 > SHA256SUMS
+
+      - uses: actions/upload-artifact@v4
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          name: homeops-ai-${{ github.sha }}-linux-amd64
+          path: release
+          if-no-files-found: error
+
+  publish:
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
 
       - uses: docker/metadata-action@v5
         id: metadata
@@ -33,23 +79,71 @@ jobs:
             type=ref,event=tag
             type=sha
 
+      - uses: docker/setup-buildx-action@v3
+
       - uses: docker/build-push-action@v6
-        id: build
         with:
           context: .
           file: Containerfile
           platforms: linux/amd64
-          push: true
-          tags: ${{ steps.metadata.outputs.tags }}
+          load: true
+          push: false
+          tags: homeops-ai:release-candidate
           labels: ${{ steps.metadata.outputs.labels }}
+          cache-from: type=gha,scope=homeops-container
+          cache-to: type=gha,mode=max,scope=homeops-container
+
+      - name: Exercise the release container
+        run: |
+          docker run --rm homeops-ai:release-candidate smoke
+          docker run --rm --entrypoint ssh homeops-ai:release-candidate -V
+          docker run --rm --entrypoint ssh homeops-ai:release-candidate -G -F /dev/null example.invalid > /dev/null
 
       - uses: aquasecurity/trivy-action@v0.36.0
         with:
-          image-ref: ghcr.io/${{ github.repository_owner }}/homeops-ai@${{ steps.build.outputs.digest }}
+          image-ref: homeops-ai:release-candidate
           scanners: vuln,secret
           severity: HIGH,CRITICAL
           ignore-unfixed: true
           exit-code: 1
 
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish the exact scanned image
+        id: publish
+        env:
+          IMAGE_TAGS: ${{ steps.metadata.outputs.tags }}
+        run: |
+          set -euo pipefail
+          mapfile -t image_tags <<< "$IMAGE_TAGS"
+          digest=""
+          published=0
+          for tag in "${image_tags[@]}"; do
+            [[ -n "$tag" ]] || continue
+            docker tag homeops-ai:release-candidate "$tag"
+            push_output="$(docker push "$tag" 2>&1)"
+            printf '%s\n' "$push_output"
+            pushed_digest="$(sed -nE 's/^.*digest: (sha256:[0-9a-f]{64}).*$/\1/p' <<< "$push_output" | tail -n 1)"
+            if [[ ! "$pushed_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              printf 'Could not determine immutable digest for %s\n' "$tag" >&2
+              exit 1
+            fi
+            if [[ -n "$digest" && "$pushed_digest" != "$digest" ]]; then
+              printf 'Published tags do not resolve to identical bytes\n' >&2
+              exit 1
+            fi
+            digest="$pushed_digest"
+            published=$((published + 1))
+          done
+          if ((published == 0)); then
+            printf 'No image tags were supplied by metadata-action\n' >&2
+            exit 1
+          fi
+          printf 'digest=%s\n' "$digest" >> "$GITHUB_OUTPUT"
+
       - name: Record immutable image reference
-        run: echo "ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/homeops-ai@${{ steps.build.outputs.digest }}" >> "$GITHUB_STEP_SUMMARY"
+        run: echo "ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/homeops-ai@${{ steps.publish.outputs.digest }}" >> "$GITHUB_STEP_SUMMARY"

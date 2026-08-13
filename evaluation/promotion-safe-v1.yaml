@@ -1,0 +1,28 @@
+schema_version: 1
+suite_id: promotion-safe-v1
+suite_version: 1
+cases:
+  - id: canonical-current-exists
+    question: Does the candidate retain canonical current-state evidence?
+    capability_class: deterministic-graph
+    query:
+      name: canonical-current
+    expected:
+      min_rows: 1
+      forbidden_statuses:
+        - historical
+        - superseded
+        - abandoned
+    live_verification_required: false
+    reviewer_notes: Candidate promotion requires at least one canonical current document.
+
+  - id: no-ambiguous-links
+    question: Did any ambiguous internal link reach the candidate database?
+    capability_class: deterministic-graph
+    query:
+      name: link-inventory
+    expected:
+      summary_equals:
+        by_resolution_state.ambiguous: 0
+    live_verification_required: false
+    reviewer_notes: Ambiguous links are a build-blocking graph correctness failure.
