@@ -109,7 +109,7 @@ def _request(manifest: dict, manifest_path: Path) -> dict:
         "publisher_id": "workstation",
         "capability_token": "a" * 64,
         "release_policy_id": _policy_id(
-            _release_policy("0.4.0", "a" * 40, "sha256:" + "b" * 64)
+            _release_policy("0.4.1", "a" * 40, "sha256:" + "b" * 64)
         ),
         "snapshot_id": manifest["snapshot_id"],
         "expected_current_deployment_id": "",
@@ -149,7 +149,7 @@ def _record(
         snapshot=snapshot,
         build=build,
         snapshot_received_at="2026-08-13T12:00:30+00:00",
-        homeops_version="0.4.0",
+        homeops_version="0.4.1",
         source_revision=source_revision,
         image_digest=image_digest,
     )
@@ -509,7 +509,7 @@ def test_remote_processor_builds_evaluates_commits_and_exposes_provenance(
     exported = tmp_path / "exported"
     revision = "a" * 40
     digest = "sha256:" + "b" * 64
-    manifest = _snapshot(source, exported, revision=revision, package_version="0.4.0")
+    manifest = _snapshot(source, exported, revision=revision, package_version="0.4.1")
     root = tmp_path / "remote"
     request_id = "11111111-1111-4111-8111-111111111111"
     request_dir = root / "incoming" / "workstation" / request_id
@@ -625,7 +625,7 @@ def test_candidate_ready_is_rejected_after_release_policy_change(tmp_path: Path)
     revision = "a" * 40
     first_digest = "sha256:" + "b" * 64
     second_digest = "sha256:" + "c" * 64
-    manifest = _snapshot(source, exported, revision=revision, package_version="0.4.0")
+    manifest = _snapshot(source, exported, revision=revision, package_version="0.4.1")
     root = tmp_path / "remote"
     request_id = "11111111-1111-4111-8111-111111111111"
     request_dir = root / "incoming" / "workstation" / request_id
@@ -638,7 +638,7 @@ def test_candidate_ready_is_rejected_after_release_policy_change(tmp_path: Path)
     wire = {
         **_request(manifest, manifest_path),
         "release_policy_id": _policy_id(
-            _release_policy("0.4.0", revision, first_digest)
+            _release_policy("0.4.1", revision, first_digest)
         ),
     }
     queued = {key: value for key, value in wire.items() if key != "capability_token"}
@@ -735,7 +735,7 @@ def test_current_match_includes_released_image_digest() -> None:
         "source_fingerprint": fingerprint,
         "artifact_fingerprint": fingerprint,
         "logical_fingerprint": fingerprint,
-        "homeops_version": "0.4.0",
+        "homeops_version": "0.4.1",
         "source_revision": "d" * 40,
         "image_digest": "sha256:" + "e" * 64,
         "snapshot_contract_version": "homeops-snapshot-v1",
@@ -744,14 +744,14 @@ def test_current_match_includes_released_image_digest() -> None:
     assert _current_matches(
         current,
         manifest,
-        homeops_version="0.4.0",
+        homeops_version="0.4.1",
         source_revision="d" * 40,
         image_digest="sha256:" + "e" * 64,
     )
     assert not _current_matches(
         current,
         manifest,
-        homeops_version="0.4.0",
+        homeops_version="0.4.1",
         source_revision="d" * 40,
         image_digest="sha256:" + "f" * 64,
     )
@@ -827,7 +827,7 @@ def test_reconcile_reads_back_exact_promoted_release_identity(tmp_path: Path) ->
                 "source_fingerprint": self.manifest["source_fingerprint"],
                 "artifact_fingerprint": self.manifest["artifact_fingerprint"],
                 "logical_fingerprint": self.manifest["logical_fingerprint"],
-                "homeops_version": "0.4.0",
+                "homeops_version": "0.4.1",
                 "source_revision": revision,
                 "image_digest": digest,
                 "snapshot_contract_version": "homeops-snapshot-v1",
@@ -889,7 +889,7 @@ def test_reconcile_reads_back_exact_promoted_release_identity(tmp_path: Path) ->
                                 "build_contract_version": "homeops-build-v1",
                                 "build_schema_version": 1,
                                 "evaluation_suite_sha256": [],
-                                "homeops_version": "0.4.0",
+                                "homeops_version": "0.4.1",
                                 "image_digest": digest,
                                 "schema_version": 1,
                                 "snapshot_contract_version": "homeops-snapshot-v1",
@@ -969,7 +969,7 @@ def test_reconcile_resumes_exact_private_attempt_after_ambiguous_submit(
                 "source_fingerprint": self.manifest["source_fingerprint"],
                 "artifact_fingerprint": self.manifest["artifact_fingerprint"],
                 "logical_fingerprint": self.manifest["logical_fingerprint"],
-                "homeops_version": "0.4.0",
+                "homeops_version": "0.4.1",
                 "source_revision": revision,
                 "image_digest": digest,
                 "snapshot_contract_version": "homeops-snapshot-v1",
@@ -1006,7 +1006,7 @@ def test_reconcile_resumes_exact_private_attempt_after_ambiguous_submit(
                     "retryable": False,
                 }
             assert verb == "status"
-            policy = _release_policy("0.4.0", revision, digest)
+            policy = _release_policy("0.4.1", revision, digest)
             outcome = "PROMOTED" if self.committed else "CANDIDATE_READY"
             return {
                 "schema_version": 1,
@@ -1148,7 +1148,7 @@ def test_commit_requested_with_source_move_polls_terminal_without_reauthorizing(
                     "run_id": "11111111-1111-4111-8111-111111111111",
                     "release_policy_id": self.request["release_policy_id"],
                     "promotion_policy_id": _policy_id(
-                        _release_policy("0.4.0", revision, digest)
+                        _release_policy("0.4.1", revision, digest)
                     ),
                     "retryable": False,
                 },
@@ -1195,7 +1195,7 @@ def test_commit_requested_with_source_move_polls_terminal_without_reauthorizing(
             state_dir=state,
             transport=transport,  # type: ignore[arg-type]
             attempt=pending,
-            release_policy=_release_policy("0.4.0", revision, digest),
+            release_policy=_release_policy("0.4.1", revision, digest),
             timeout_seconds=2,
         )
     assert transport.commit_calls == 0
@@ -1362,7 +1362,7 @@ def test_commit_journal_repairs_bookkeeping_after_active_cas_crash(
     (data / "active.json").write_text(json.dumps(selected_expected), encoding="utf-8")
     deployment_path = data / "deployments" / f"{candidate['deployment_id']}.json"
     assert build_module.store_deployment(data, candidate) == deployment_path
-    policy = _release_policy("0.4.0", revision, digest)
+    policy = _release_policy("0.4.1", revision, digest)
     policy_id = _policy_id(policy)
     build_dir = data / "builds" / candidate["run_id"]
     build_dir.mkdir(parents=True)

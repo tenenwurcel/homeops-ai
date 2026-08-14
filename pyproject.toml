@@ -1,12 +1,13 @@
 [project]
 name = "homeops-ai"
-version = "0.4.0"
+version = "0.4.1"
 description = "Evidence-backed HomeOps knowledge platform"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
 dependencies = [
+    "cryptography>=50,<51",
     "markdown-it-py>=4,<5",
-    "mcp>=1.27,<2",
+    "mcp>=1.28.1,<2",
     "pycozo[embedded]==0.7.6",
     "ruamel-yaml>=0.18,<0.19",
 ]
