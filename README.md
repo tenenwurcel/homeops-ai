@@ -171,6 +171,24 @@ builds `./cmd/homeops-receiver` from the same tagged source with
 and grants the publisher no filesystem access to pipeline spools. The MCP
 service resolves only the atomically selected, verified Cozo deployment.
 
+Deployment retention starts with a fail-closed inventory only. The planner
+retains the current and previous pairs, three additional verified deployments,
+builds pinned by a live reader, unresolved pipeline attempts, and failure
+evidence. It emits only exact allowlisted bundle paths and accounts for snapshots
+shared by multiple deployments:
+
+```bash
+uv run homeops-ai pipeline retention-plan \
+  --root /var/lib/homeops-ai \
+  --keep-additional-verified 3
+```
+
+This command is always a dry run. HomeOps intentionally provides no
+deployment-retention apply/delete command or scheduled retention cleanup. Any
+future cleanup remains separately gated by operational soak, review of the exact
+plan, and rollback verification. The legacy `db cleanup --failed` command is a
+separate, manually invoked surface and does not apply a retention plan.
+
 Tagged releases and manually dispatched runs first run the complete Python and
 Go suites (including the race detector and vet), build the Python and receiver
 artifacts, build and exercise the runtime container, and scan it. Only then does

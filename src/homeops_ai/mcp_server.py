@@ -6,7 +6,12 @@ from mcp.server.fastmcp import FastMCP
 
 from homeops_ai.build import active_state
 from homeops_ai.context_compiler import ContextCompilerError, compile_context
-from homeops_ai.query import QueryError, build_manifest, execute_query, query_names
+from homeops_ai.query import (
+    QueryError,
+    execute_query,
+    pinned_build_manifest,
+    query_names,
+)
 
 
 DEFAULT_DATA_DIR = Path("data")
@@ -52,37 +57,37 @@ def _bounded_rows(result: dict[str, Any], max_rows: int) -> dict[str, Any]:
 
 
 def get_build_status(data_dir: Path, run_id: str | None = None) -> dict[str, Any]:
-    manifest = build_manifest(data_dir, run_id=run_id)
-    validation_path = (
-        data_dir.resolve() / "builds" / manifest["run_id"] / "validation.json"
-    )
-    validation = None
-    if validation_path.is_file():
-        import json
+    with pinned_build_manifest(data_dir, run_id=run_id) as manifest:
+        validation_path = (
+            data_dir.resolve() / "builds" / manifest["run_id"] / "validation.json"
+        )
+        validation = None
+        if validation_path.is_file():
+            import json
 
-        validation = json.loads(validation_path.read_text(encoding="utf-8"))
-    return {
-        "schema_version": 2,
-        "run_id": manifest["run_id"],
-        "deployment": manifest["_deployment_provenance"],
-        "active": active_state(data_dir.resolve()),
-        "result": manifest["result"],
-        "profile": manifest["profile"],
-        "started_at": manifest["started_at"],
-        "completed_at": manifest["completed_at"],
-        "verified_at": manifest.get("verified_at"),
-        "source_fingerprint": manifest["source_fingerprint"],
-        "logical_fingerprint": manifest["logical_fingerprint"],
-        "artifact_fingerprint": manifest["artifact_fingerprint"],
-        "counts": manifest["counts"],
-        "validation": validation,
-        "available_queries": query_names(),
-        "trust_policy": {
-            "read_only": True,
-            "generated_answer": False,
-            "live_discovery_performed": False,
-        },
-    }
+            validation = json.loads(validation_path.read_text(encoding="utf-8"))
+        return {
+            "schema_version": 2,
+            "run_id": manifest["run_id"],
+            "deployment": manifest["_deployment_provenance"],
+            "active": active_state(data_dir.resolve()),
+            "result": manifest["result"],
+            "profile": manifest["profile"],
+            "started_at": manifest["started_at"],
+            "completed_at": manifest["completed_at"],
+            "verified_at": manifest.get("verified_at"),
+            "source_fingerprint": manifest["source_fingerprint"],
+            "logical_fingerprint": manifest["logical_fingerprint"],
+            "artifact_fingerprint": manifest["artifact_fingerprint"],
+            "counts": manifest["counts"],
+            "validation": validation,
+            "available_queries": query_names(),
+            "trust_policy": {
+                "read_only": True,
+                "generated_answer": False,
+                "live_discovery_performed": False,
+            },
+        }
 
 
 def run_stable_query(

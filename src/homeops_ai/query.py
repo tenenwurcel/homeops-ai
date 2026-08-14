@@ -1,13 +1,16 @@
 import re
 from collections import Counter, defaultdict, deque
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 from homeops_ai.database import open_database
 from homeops_ai.deployment import (
     DeploymentError,
     deployment_for_run,
     provenance,
+    retention_lock,
+    run_pin,
     strict_json_loads,
 )
 
@@ -82,11 +85,34 @@ def build_manifest(data_dir: Path, run_id: str | None = None) -> dict[str, Any]:
     return manifest
 
 
+@contextmanager
+def pinned_build_manifest(
+    data_dir: Path, run_id: str | None = None
+) -> Iterator[dict[str, Any]]:
+    """Resolve and pin one immutable build for the complete read operation."""
+
+    data = data_dir.resolve()
+    with ExitStack() as pin_stack:
+        try:
+            with retention_lock(data, blocking=True, shared=True):
+                manifest = build_manifest(data, run_id)
+                pin_stack.enter_context(run_pin(data, manifest["run_id"]))
+        except DeploymentError as error:
+            raise QueryError(str(error)) from error
+        # The retention lock protects only selection-to-pin handoff. Holding
+        # just the run pin here lets writers build or promote concurrently.
+        yield manifest
+
+
 def _select(client: Any, query: str, columns: list[str]) -> list[dict[str, Any]]:
     rows = client.run(query, immutable=True)["rows"]
     return [
-        {column: str(value) if column.endswith("_id") and value is not None else value
-         for column, value in zip(columns, row, strict=True)}
+        {
+            column: str(value)
+            if column.endswith("_id") and value is not None
+            else value
+            for column, value in zip(columns, row, strict=True)
+        }
         for row in rows
     ]
 
@@ -147,7 +173,9 @@ def _content(client: Any) -> dict[str, str]:
     return {row["document_id"]: row["raw_markdown"] for row in rows}
 
 
-def _result(rows: list[dict[str, Any]], summary: dict[str, Any] | None = None) -> dict[str, Any]:
+def _result(
+    rows: list[dict[str, Any]], summary: dict[str, Any] | None = None
+) -> dict[str, Any]:
     return {"rows": rows, "summary": summary or {"row_count": len(rows)}}
 
 
@@ -165,17 +193,24 @@ def _links_to(client: Any, params: dict[str, str]) -> dict[str, Any]:
     if not title:
         raise QueryError("links-to requires parameter: title")
     sources = _sources(client)
-    targets = [source for source in sources if source["title"].casefold() == title.casefold()]
+    targets = [
+        source for source in sources if source["title"].casefold() == title.casefold()
+    ]
     if len(targets) != 1:
-        raise QueryError(f"expected exactly one source titled {title!r}, found {len(targets)}")
+        raise QueryError(
+            f"expected exactly one source titled {title!r}, found {len(targets)}"
+        )
     target_id = targets[0]["document_id"]
     documents = {document["document_id"]: document for document in _documents(client)}
     linked = {
         link["source_document_id"]
         for link in _links(client)
-        if link["resolution_state"] == "resolved" and link["resolved_target_id"] == target_id
+        if link["resolution_state"] == "resolved"
+        and link["resolved_target_id"] == target_id
     }
-    rows = [documents[document_id] for document_id in linked if document_id in documents]
+    rows = [
+        documents[document_id] for document_id in linked if document_id in documents
+    ]
     return _result(sorted(rows, key=lambda row: row["source_path"].casefold()))
 
 
@@ -184,9 +219,13 @@ def _reachable_from(client: Any, params: dict[str, str]) -> dict[str, Any]:
     if not title:
         raise QueryError("reachable-from requires parameter: title")
     sources = _sources(client)
-    roots = [source for source in sources if source["title"].casefold() == title.casefold()]
+    roots = [
+        source for source in sources if source["title"].casefold() == title.casefold()
+    ]
     if len(roots) != 1:
-        raise QueryError(f"expected exactly one source titled {title!r}, found {len(roots)}")
+        raise QueryError(
+            f"expected exactly one source titled {title!r}, found {len(roots)}"
+        )
 
     edges: dict[str, set[str]] = defaultdict(set)
     for link in _links(client):
@@ -210,7 +249,13 @@ def _link_inventory(client: Any, _: dict[str, str]) -> dict[str, Any]:
     rows = []
     for link in _links(client):
         source = sources[link["source_document_id"]]
-        rows.append({"source_path": source["source_path"], "source_title": source["title"], **link})
+        rows.append(
+            {
+                "source_path": source["source_path"],
+                "source_title": source["title"],
+                **link,
+            }
+        )
     rows.sort(key=lambda row: (row["source_path"].casefold(), row["ordinal"]))
     by_resolution_state = Counter(row["resolution_state"] for row in rows)
     by_link_kind = Counter(row["link_kind"] for row in rows)
@@ -234,7 +279,10 @@ def _missing_lifecycle(client: Any, _: dict[str, str]) -> dict[str, Any]:
     rows = [
         document
         for document in _documents(client)
-        if any(document[field] is None for field in ("document_type", "status", "authority"))
+        if any(
+            document[field] is None
+            for field in ("document_type", "status", "authority")
+        )
     ]
     return _result(sorted(rows, key=lambda row: row["source_path"].casefold()))
 
@@ -265,7 +313,9 @@ def _guidance_conflicts(client: Any, _: dict[str, str]) -> dict[str, Any]:
         rows.append(
             {
                 **document,
-                "connected_current_paths": sorted(documents[item]["source_path"] for item in connected_ids),
+                "connected_current_paths": sorted(
+                    documents[item]["source_path"] for item in connected_ids
+                ),
             }
         )
     return _result(sorted(rows, key=lambda row: row["source_path"].casefold()))
@@ -273,7 +323,13 @@ def _guidance_conflicts(client: Any, _: dict[str, str]) -> dict[str, Any]:
 
 def _terms(question: str) -> list[str]:
     words = re.findall(r"[a-z0-9]+(?:[_.-][a-z0-9]+)*", question.casefold())
-    return sorted({word for word in words if (len(word) >= 3 or word == "not") and word not in STOPWORDS})
+    return sorted(
+        {
+            word
+            for word in words
+            if (len(word) >= 3 or word == "not") and word not in STOPWORDS
+        }
+    )
 
 
 def _excerpt(body: str, terms: list[str], limit: int = 360) -> str:
@@ -345,7 +401,9 @@ def _context(client: Any, params: dict[str, str]) -> dict[str, Any]:
         authority_score = (
             10
             if document["authority"] == "canonical"
-            else 2 if document["authority"] == "supporting" else 0
+            else 2
+            if document["authority"] == "supporting"
+            else 0
         )
         status_score = {
             "current": 8,
@@ -362,7 +420,13 @@ def _context(client: Any, params: dict[str, str]) -> dict[str, Any]:
             if document["status"] == "done":
                 current_intent_score -= 8
         section_score = evidence[0]["score"] if evidence else 0
-        score = title_score + section_score + authority_score + status_score + current_intent_score
+        score = (
+            title_score
+            + section_score
+            + authority_score
+            + status_score
+            + current_intent_score
+        )
         ranked.append(
             {
                 **document,
@@ -380,7 +444,14 @@ def _context(client: Any, params: dict[str, str]) -> dict[str, Any]:
         )
 
     ranked.sort(key=lambda row: (-row["score"], row["source_path"].casefold()))
-    return _result(ranked[:limit], {"row_count": min(len(ranked), limit), "search_terms": terms, "candidate_count": len(ranked)})
+    return _result(
+        ranked[:limit],
+        {
+            "row_count": min(len(ranked), limit),
+            "search_terms": terms,
+            "candidate_count": len(ranked),
+        },
+    )
 
 
 QUERY_HANDLERS: dict[str, Callable[[Any, dict[str, str]], dict[str, Any]]] = {
@@ -405,9 +476,21 @@ def execute_query(
     *,
     run_id: str | None = None,
 ) -> dict[str, Any]:
+    with pinned_build_manifest(data_dir, run_id) as manifest:
+        return execute_query_for_manifest(manifest, name, params)
+
+
+def execute_query_for_manifest(
+    manifest: dict[str, Any],
+    name: str,
+    params: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """Execute against a manifest held by :func:`pinned_build_manifest`."""
+
     if name not in QUERY_HANDLERS:
-        raise QueryError(f"unknown query {name!r}; choose from: {', '.join(query_names())}")
-    manifest = build_manifest(data_dir, run_id)
+        raise QueryError(
+            f"unknown query {name!r}; choose from: {', '.join(query_names())}"
+        )
     with open_database(Path(manifest["_database_path"])) as client:
         result = QUERY_HANDLERS[name](client, params or {})
     return {

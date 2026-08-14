@@ -35,7 +35,7 @@ from homeops_ai.migration import (
 )
 from homeops_ai.source_contract import discover_sources, export_snapshot
 from homeops_ai.query import QueryError, execute_query, query_names
-from homeops_ai.deployment import DeploymentError
+from homeops_ai.deployment import DeploymentError, durable_atomic_json
 from homeops_ai.pipeline import (
     DEFAULT_PUBLISHER_ID,
     PipelineError,
@@ -46,6 +46,12 @@ from homeops_ai.pipeline import (
     verify_active,
 )
 from homeops_ai.snapshot import SnapshotError
+from homeops_ai.retention import (
+    RetentionError,
+    RetentionPolicy,
+    plan_deployment_retention,
+    validate_retention_output,
+)
 
 
 _PIPELINE_FAILURE_OUTCOMES = {
@@ -137,7 +143,9 @@ def build_parser() -> argparse.ArgumentParser:
     snapshot.add_argument("--vault", type=Path, required=True)
     snapshot.add_argument("--output", type=Path, required=True)
 
-    database = subparsers.add_parser("db", help="build and manage derived Cozo databases")
+    database = subparsers.add_parser(
+        "db", help="build and manage derived Cozo databases"
+    )
     database_subparsers = database.add_subparsers(
         dest="database_command", required=True
     )
@@ -182,9 +190,13 @@ def build_parser() -> argparse.ArgumentParser:
     candidate_evaluate_parser = database_subparsers.add_parser(
         "evaluate-candidate", help="run promotion-safe checks against an explicit run"
     )
-    candidate_evaluate_parser.add_argument("--data-dir", type=Path, default=Path("data"))
+    candidate_evaluate_parser.add_argument(
+        "--data-dir", type=Path, default=Path("data")
+    )
     candidate_evaluate_parser.add_argument("--run-id", required=True)
-    candidate_evaluate_parser.add_argument("--cases", type=Path, action="append", default=[])
+    candidate_evaluate_parser.add_argument(
+        "--cases", type=Path, action="append", default=[]
+    )
 
     cleanup_parser = database_subparsers.add_parser(
         "cleanup", help="remove database directories for failed builds"
@@ -192,13 +204,17 @@ def build_parser() -> argparse.ArgumentParser:
     cleanup_parser.add_argument("--data-dir", type=Path, default=Path("data"))
     cleanup_parser.add_argument("--failed", action="store_true", required=True)
 
-    query = subparsers.add_parser("query", help="run a stable read-only knowledge query")
+    query = subparsers.add_parser(
+        "query", help="run a stable read-only knowledge query"
+    )
     query.add_argument("name", choices=query_names())
     query.add_argument("--data-dir", type=Path, default=Path("data"))
     query.add_argument("--run-id")
     query.add_argument("--param", action="append", default=[], metavar="KEY=VALUE")
 
-    evaluate = subparsers.add_parser("evaluate", help="run a versioned evaluation suite")
+    evaluate = subparsers.add_parser(
+        "evaluate", help="run a versioned evaluation suite"
+    )
     evaluate.add_argument(
         "--cases",
         type=Path,
@@ -208,7 +224,9 @@ def build_parser() -> argparse.ArgumentParser:
     evaluate.add_argument("--run-id")
     evaluate.add_argument("--output", type=Path, required=True)
 
-    context = subparsers.add_parser("context", help="compile trustworthy evidence bundles")
+    context = subparsers.add_parser(
+        "context", help="compile trustworthy evidence bundles"
+    )
     context_subparsers = context.add_subparsers(dest="context_command", required=True)
     compile_parser = context_subparsers.add_parser(
         "compile", help="compile a deterministic context bundle"
@@ -273,6 +291,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     publish_current_parser.add_argument("--root", type=Path, required=True)
 
+    retention_plan_parser = pipeline_subparsers.add_parser(
+        "retention-plan",
+        help="inventory exact deployment-retention targets without deleting anything",
+    )
+    retention_plan_parser.add_argument("--root", type=Path, required=True)
+    retention_plan_parser.add_argument(
+        "--keep-additional-verified", type=int, default=3
+    )
+    retention_plan_parser.add_argument("--output", type=Path)
+
     return parser
 
 
@@ -322,10 +350,39 @@ def main() -> None:
                 result = verify_active(args.root)
             elif args.pipeline_command == "publish-current":
                 result = publish_current_status(args.root)
+            elif args.pipeline_command == "retention-plan":
+                output = (
+                    validate_retention_output(args.root, args.output)
+                    if args.output
+                    else None
+                )
+                result = plan_deployment_retention(
+                    args.root,
+                    policy=RetentionPolicy(
+                        keep_additional_verified=args.keep_additional_verified
+                    ),
+                )
+                if output:
+                    durable_atomic_json(
+                        validate_retention_output(args.root, output),
+                        result,
+                        mode=0o600,
+                    )
             else:
                 raise PipelineError("INTERNAL_ERROR", "unsupported pipeline command")
-            print(json.dumps(result, indent=2))
+            print(
+                json.dumps(
+                    result,
+                    indent=2,
+                    sort_keys=args.pipeline_command == "retention-plan",
+                )
+            )
             if _pipeline_result_failed(result):
+                raise SystemExit(2)
+            if (
+                args.pipeline_command == "retention-plan"
+                and result["summary"]["blocked"]
+            ):
                 raise SystemExit(2)
             return
         except (
@@ -334,6 +391,7 @@ def main() -> None:
             DeploymentError,
             SnapshotError,
             OSError,
+            RetentionError,
             ValueError,
         ) as error:
             raise SystemExit(str(error)) from error
@@ -450,7 +508,9 @@ def main() -> None:
             elif args.database_command == "cleanup":
                 result = {"cleaned_failed_builds": cleanup_failed(args.data_dir)}
             else:
-                raise BuildError(f"unsupported database command: {args.database_command}")
+                raise BuildError(
+                    f"unsupported database command: {args.database_command}"
+                )
             print(json.dumps(result, indent=2))
             return
         except (BuildError, OSError, ValueError) as error:
@@ -508,7 +568,9 @@ def main() -> None:
                             "output": str(args.output.resolve()),
                             "run_id": bundle["build"]["run_id"],
                             **bundle["selection"],
-                            "live_verification_required": bundle["live_verification"]["required"],
+                            "live_verification_required": bundle["live_verification"][
+                                "required"
+                            ],
                         },
                         indent=2,
                     )

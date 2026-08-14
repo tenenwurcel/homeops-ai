@@ -36,7 +36,6 @@ from homeops_ai.pipeline import (
     _load_pending_attempt,
     _policy_id,
     _release_policy,
-    _resume_pending_attempt,
     _write_commit_journal,
     process_remote,
     reconcile,
@@ -109,12 +108,87 @@ def _request(manifest: dict, manifest_path: Path) -> dict:
         "publisher_id": "workstation",
         "capability_token": "a" * 64,
         "release_policy_id": _policy_id(
-            _release_policy("0.4.1", "a" * 40, "sha256:" + "b" * 64)
+            _release_policy("0.4.2", "a" * 40, "sha256:" + "b" * 64)
         ),
         "snapshot_id": manifest["snapshot_id"],
         "expected_current_deployment_id": "",
         "snapshot_manifest_sha256": file_sha256(manifest_path),
     }
+
+
+def _queue_received_snapshot(
+    root: Path,
+    source: Path,
+    *,
+    request_id: str,
+    expected_current_deployment_id: str,
+    revision: str,
+    image_digest: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    payload = root / "incoming" / "workstation" / request_id / "payload"
+    manifest = _snapshot(
+        source,
+        payload / "vault",
+        revision=revision,
+        package_version="0.4.2",
+    )
+    manifest_path = payload / "snapshot.json"
+    write_manifest(manifest_path, manifest)
+    wire = {
+        **_request(manifest, manifest_path),
+        "request_id": request_id,
+        "expected_current_deployment_id": expected_current_deployment_id,
+        "release_policy_id": _policy_id(
+            _release_policy("0.4.2", revision, image_digest)
+        ),
+    }
+    queued = {key: value for key, value in wire.items() if key != "capability_token"}
+    (payload / "request.json").write_bytes(
+        canonical_receiver_json(queued, tuple(queued))
+    )
+    wire_bytes = canonical_receiver_json(wire, tuple(wire))
+    proofs = [
+        {
+            "path": "request.json",
+            "size": len(wire_bytes),
+            "sha256": hashlib.sha256(wire_bytes).hexdigest(),
+        },
+        {
+            "path": "snapshot.json",
+            "size": manifest_path.stat().st_size,
+            "sha256": file_sha256(manifest_path),
+        },
+        *(
+            {
+                "path": f"vault/{item['path']}",
+                "size": item["size"],
+                "sha256": item["sha256"],
+            }
+            for item in manifest["inventory"]
+        ),
+    ]
+    receipt = {
+        "schema_version": 1,
+        "protocol": RECEIVER_PROTOCOL,
+        "request_id": request_id,
+        "publisher_id": "workstation",
+        "capability_sha256": hashlib.sha256(bytes.fromhex("a" * 64)).hexdigest(),
+        "release_policy_id": wire["release_policy_id"],
+        "snapshot_id": manifest["snapshot_id"],
+        "expected_current_deployment_id": expected_current_deployment_id,
+        "snapshot_manifest_sha256": file_sha256(manifest_path),
+        "archive_sha256": hashlib.sha256(request_id.encode()).hexdigest(),
+        "archive_bytes": sum(item["size"] for item in proofs) + 1024,
+        "extracted_bytes": sum(item["size"] for item in proofs),
+        "file_count": len(proofs),
+        "vault_file_count": manifest["file_count"],
+        "files": proofs,
+    }
+    receipt_path = payload.parent / "receipt.json"
+    receipt_path.write_text(
+        json.dumps(receipt, separators=(",", ":")) + "\n", encoding="utf-8"
+    )
+    return manifest, receipt
 
 
 def _record(
@@ -149,13 +223,15 @@ def _record(
         snapshot=snapshot,
         build=build,
         snapshot_received_at="2026-08-13T12:00:30+00:00",
-        homeops_version="0.4.1",
+        homeops_version="0.4.2",
         source_revision=source_revision,
         image_digest=image_digest,
     )
 
 
-def test_snapshot_manifest_and_ustar_are_strict_and_deterministic(tmp_path: Path) -> None:
+def test_snapshot_manifest_and_ustar_are_strict_and_deterministic(
+    tmp_path: Path,
+) -> None:
     vault = tmp_path / "vault"
     vault.mkdir()
     _write_vault(vault)
@@ -187,7 +263,15 @@ def test_snapshot_manifest_and_ustar_are_strict_and_deterministic(tmp_path: Path
 
 @pytest.mark.parametrize(
     "path",
-    ["/absolute", "../escape", "a/../b", "a\\b", "./a", "\u00c1 Evidence.md", "control\nname.md"],
+    [
+        "/absolute",
+        "../escape",
+        "a/../b",
+        "a\\b",
+        "./a",
+        "\u00c1 Evidence.md",
+        "control\nname.md",
+    ],
 )
 def test_snapshot_paths_fail_closed(path: str) -> None:
     with pytest.raises(SnapshotError):
@@ -262,7 +346,9 @@ def test_deployment_compare_and_swap_rollback_and_projection(tmp_path: Path) -> 
         selected_second, promoted_at="2026-08-13T12:05:00+00:00"
     )
     assert rolled_back["current_deployment"]["deployment_id"] == first["deployment_id"]
-    assert rolled_back["previous_deployment"]["deployment_id"] == second["deployment_id"]
+    assert (
+        rolled_back["previous_deployment"]["deployment_id"] == second["deployment_id"]
+    )
 
     projection = publish_current_projection(tmp_path, selected_second)
     assert projection == current_projection(selected_second)
@@ -282,7 +368,9 @@ def test_deployment_compare_and_swap_rollback_and_projection(tmp_path: Path) -> 
         "build_contract_version",
         "promoted_at",
     )
-    assert (tmp_path / "pipeline-state" / "current.json").stat().st_mode & 0o777 == 0o640
+    assert (
+        tmp_path / "pipeline-state" / "current.json"
+    ).stat().st_mode & 0o777 == 0o640
 
 
 def test_rollback_recovers_history_and_projection_after_active_cas(
@@ -322,9 +410,10 @@ def test_rollback_recovers_history_and_projection_after_active_cas(
         rollback(data)
 
     selected_after_crash = active_state(data)
-    assert selected_after_crash["current_deployment"]["deployment_id"] == first[
-        "deployment_id"
-    ]
+    assert (
+        selected_after_crash["current_deployment"]["deployment_id"]
+        == first["deployment_id"]
+    )
     journal = data / "pipeline-transactions" / "rollback.json"
     assert journal.is_file()
     assert not (tmp_path / "pipeline-state" / "current.json").exists()
@@ -344,9 +433,10 @@ def test_rollback_recovers_history_and_projection_after_active_cas(
         (data / "deployment-history" / first["deployment_id"]).glob("*.json")
     )
     assert len(history) == 1
-    assert json.loads(history[0].read_text(encoding="utf-8")) == recovered[
-        "current_deployment"
-    ]
+    assert (
+        json.loads(history[0].read_text(encoding="utf-8"))
+        == recovered["current_deployment"]
+    )
     assert json.loads(
         (tmp_path / "pipeline-state" / "current.json").read_text(encoding="utf-8")
     ) == current_projection(recovered)
@@ -407,9 +497,7 @@ def test_process_entry_finishes_rollback_journal_written_before_active_cas(
         expected_current_deployment_id=first["deployment_id"],
         promoted_at="2026-08-13T12:04:00+00:00",
     )
-    target = rollback_transition(
-        source, promoted_at="2026-08-13T12:05:00+00:00"
-    )
+    target = rollback_transition(source, promoted_at="2026-08-13T12:05:00+00:00")
     data.mkdir()
     (data / "active.json").write_text(json.dumps(source), encoding="utf-8")
     build_module._write_rollback_journal(data, source, target)
@@ -433,11 +521,18 @@ def test_strict_json_rejects_duplicates_and_legacy_projection_fails_closed() -> 
         strict_json_loads('{"schema_version":2,"schema_version":2}')
     with pytest.raises(DeploymentError, match="unadopted legacy"):
         current_projection(
-            {"schema_version": 1, "current": "run", "previous": None, "promoted_at": None}
+            {
+                "schema_version": 1,
+                "current": "run",
+                "previous": None,
+                "promoted_at": None,
+            }
         )
 
 
-def test_legacy_adoption_requires_actual_matching_snapshot_bytes(tmp_path: Path) -> None:
+def test_legacy_adoption_requires_actual_matching_snapshot_bytes(
+    tmp_path: Path,
+) -> None:
     vault = tmp_path / "vault"
     vault.mkdir()
     _write_vault(vault, "First state.\n")
@@ -455,48 +550,49 @@ def test_legacy_adoption_requires_actual_matching_snapshot_bytes(tmp_path: Path)
     _snapshot(vault, second_snapshot)
 
     with pytest.raises(BuildError, match="fingerprint mismatch"):
-        adopt_legacy_state(
-            data, first_snapshot, previous_vault=first_snapshot
-        )
+        adopt_legacy_state(data, first_snapshot, previous_vault=first_snapshot)
     assert active_state(data)["schema_version"] == 1
     assert not (tmp_path / "pipeline-state" / "current.json").exists()
 
-    adopted = adopt_legacy_state(
-        data, second_snapshot, previous_vault=first_snapshot
-    )
+    adopted = adopt_legacy_state(data, second_snapshot, previous_vault=first_snapshot)
     assert adopted["schema_version"] == 2
     assert adopted["current"] == second["run_id"]
     assert adopted["previous"] == first["run_id"]
     projection = json.loads(
         (tmp_path / "pipeline-state" / "current.json").read_text(encoding="utf-8")
     )
-    assert projection["current_deployment_id"] == adopted["current_deployment"][
-        "deployment_id"
-    ]
-    current_dir = tmp_path / "vault-snapshots" / adopted["current_deployment"][
-        "snapshot_id"
-    ]
-    previous_dir = tmp_path / "vault-snapshots" / adopted["previous_deployment"][
-        "snapshot_id"
-    ]
+    assert (
+        projection["current_deployment_id"]
+        == adopted["current_deployment"]["deployment_id"]
+    )
+    current_dir = (
+        tmp_path / "vault-snapshots" / adopted["current_deployment"]["snapshot_id"]
+    )
+    previous_dir = (
+        tmp_path / "vault-snapshots" / adopted["previous_deployment"]["snapshot_id"]
+    )
     assert (current_dir / "snapshot.json").is_file()
     assert (previous_dir / "snapshot.json").is_file()
     assert verify_active(tmp_path)["run_id"] == second["run_id"]
 
     (tmp_path / "pipeline-state" / "current.json").unlink()
-    readopted = adopt_legacy_state(
-        data, second_snapshot, previous_vault=first_snapshot
-    )
+    readopted = adopt_legacy_state(data, second_snapshot, previous_vault=first_snapshot)
     assert readopted == adopted
-    assert json.loads(
-        (tmp_path / "pipeline-state" / "current.json").read_text(encoding="utf-8")
-    )["run_id"] == second["run_id"]
+    assert (
+        json.loads(
+            (tmp_path / "pipeline-state" / "current.json").read_text(encoding="utf-8")
+        )["run_id"]
+        == second["run_id"]
+    )
 
     rolled_back = rollback(data)
     assert rolled_back["current"] == first["run_id"]
-    assert json.loads(
-        (tmp_path / "pipeline-state" / "current.json").read_text(encoding="utf-8")
-    )["run_id"] == first["run_id"]
+    assert (
+        json.loads(
+            (tmp_path / "pipeline-state" / "current.json").read_text(encoding="utf-8")
+        )["run_id"]
+        == first["run_id"]
+    )
     assert verify_active(tmp_path)["run_id"] == first["run_id"]
 
 
@@ -509,7 +605,7 @@ def test_remote_processor_builds_evaluates_commits_and_exposes_provenance(
     exported = tmp_path / "exported"
     revision = "a" * 40
     digest = "sha256:" + "b" * 64
-    manifest = _snapshot(source, exported, revision=revision, package_version="0.4.1")
+    manifest = _snapshot(source, exported, revision=revision, package_version="0.4.2")
     root = tmp_path / "remote"
     request_id = "11111111-1111-4111-8111-111111111111"
     request_dir = root / "incoming" / "workstation" / request_id
@@ -522,9 +618,7 @@ def test_remote_processor_builds_evaluates_commits_and_exposes_provenance(
     manifest_path = payload / "snapshot.json"
     write_manifest(manifest_path, manifest)
     wire = _request(manifest, manifest_path)
-    queued = {
-        key: value for key, value in wire.items() if key != "capability_token"
-    }
+    queued = {key: value for key, value in wire.items() if key != "capability_token"}
     queued_fields = tuple(queued)
     (payload / "request.json").write_bytes(
         canonical_receiver_json(queued, queued_fields)
@@ -617,7 +711,81 @@ def test_remote_processor_builds_evaluates_commits_and_exposes_provenance(
     assert query["deployment"]["snapshot_id"] == manifest["snapshot_id"]
 
 
-def test_candidate_ready_is_rejected_after_release_policy_change(tmp_path: Path) -> None:
+def test_evaluation_failure_preserves_selected_deployment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "remote"
+    data = root / "data"
+    revision = "a" * 40
+    digest = "sha256:" + "b" * 64
+
+    selected_source = tmp_path / "selected-source"
+    selected_source.mkdir()
+    _write_vault(selected_source, "Selected HomeOps evidence.\n")
+    staging = root / "selected-staging"
+    selected_manifest = _snapshot(
+        selected_source,
+        staging / "vault",
+        revision=revision,
+        package_version="0.4.2",
+    )
+    selected_snapshot = root / "vault-snapshots" / selected_manifest["snapshot_id"]
+    selected_snapshot.parent.mkdir(parents=True)
+    staging.rename(selected_snapshot)
+    write_manifest(selected_snapshot / "snapshot.json", selected_manifest)
+    selected_build = rebuild(
+        selected_snapshot / "vault",
+        data,
+        snapshot_manifest=selected_manifest,
+        snapshot_received_at="2026-08-13T12:00:30+00:00",
+        homeops_version="0.4.2",
+        source_revision=revision,
+        image_digest=digest,
+        expected_current_deployment_id=None,
+    )
+    selected_id = selected_build["deployment_id"]
+    assert active_state(data)["current_deployment"]["deployment_id"] == selected_id
+
+    candidate_source = tmp_path / "candidate-source"
+    candidate_source.mkdir()
+    _write_vault(candidate_source, "Candidate that must fail evaluation.\n")
+    request_id = "22222222-2222-4222-8222-222222222222"
+    _queue_received_snapshot(
+        root,
+        candidate_source,
+        request_id=request_id,
+        expected_current_deployment_id=selected_id,
+        revision=revision,
+        image_digest=digest,
+    )
+    monkeypatch.setattr(
+        "homeops_ai.pipeline.evaluate_candidate",
+        lambda *args, **kwargs: {"passed": False},
+    )
+
+    processed = process_remote(
+        root,
+        source_revision=revision,
+        image_digest=digest,
+    )
+
+    assert processed["outcomes"] == ["EVALUATION_FAILED"]
+    selected_after = active_state(data)["current_deployment"]
+    assert selected_after["deployment_id"] == selected_id
+    result = strict_json_loads(
+        (root / "results" / "workstation" / f"{request_id}.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert result["outcome"] == "EVALUATION_FAILED"
+    assert result["retryable"] is False
+    assert "candidate_deployment_id" not in result
+    assert not (root / "commits" / "workstation" / f"{request_id}.json").exists()
+
+
+def test_candidate_ready_is_rejected_after_release_policy_change(
+    tmp_path: Path,
+) -> None:
     source = tmp_path / "source"
     source.mkdir()
     _write_vault(source)
@@ -625,7 +793,7 @@ def test_candidate_ready_is_rejected_after_release_policy_change(tmp_path: Path)
     revision = "a" * 40
     first_digest = "sha256:" + "b" * 64
     second_digest = "sha256:" + "c" * 64
-    manifest = _snapshot(source, exported, revision=revision, package_version="0.4.1")
+    manifest = _snapshot(source, exported, revision=revision, package_version="0.4.2")
     root = tmp_path / "remote"
     request_id = "11111111-1111-4111-8111-111111111111"
     request_dir = root / "incoming" / "workstation" / request_id
@@ -638,7 +806,7 @@ def test_candidate_ready_is_rejected_after_release_policy_change(tmp_path: Path)
     wire = {
         **_request(manifest, manifest_path),
         "release_policy_id": _policy_id(
-            _release_policy("0.4.1", revision, first_digest)
+            _release_policy("0.4.2", revision, first_digest)
         ),
     }
     queued = {key: value for key, value in wire.items() if key != "capability_token"}
@@ -735,7 +903,7 @@ def test_current_match_includes_released_image_digest() -> None:
         "source_fingerprint": fingerprint,
         "artifact_fingerprint": fingerprint,
         "logical_fingerprint": fingerprint,
-        "homeops_version": "0.4.1",
+        "homeops_version": "0.4.2",
         "source_revision": "d" * 40,
         "image_digest": "sha256:" + "e" * 64,
         "snapshot_contract_version": "homeops-snapshot-v1",
@@ -744,16 +912,189 @@ def test_current_match_includes_released_image_digest() -> None:
     assert _current_matches(
         current,
         manifest,
-        homeops_version="0.4.1",
+        homeops_version="0.4.2",
         source_revision="d" * 40,
         image_digest="sha256:" + "e" * 64,
     )
     assert not _current_matches(
         current,
         manifest,
-        homeops_version="0.4.1",
+        homeops_version="0.4.2",
         source_revision="d" * 40,
         image_digest="sha256:" + "f" * 64,
+    )
+
+
+def test_reconcile_rejects_source_mutation_during_export_before_remote_contact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    _write_vault(vault)
+
+    original_export = export_snapshot
+
+    def mutating_export(source: Path, destination: Path) -> dict[str, Any]:
+        result = original_export(source, destination)
+        note = source / "AI Context.md"
+        note.write_text(
+            note.read_text(encoding="utf-8") + "Changed during export.\n",
+            encoding="utf-8",
+        )
+        return result
+
+    monkeypatch.setattr("homeops_ai.pipeline.export_snapshot", mutating_export)
+
+    class NoContactTransport:
+        current_calls = 0
+        protocol_calls = 0
+
+        def current(self) -> dict[str, Any]:
+            self.current_calls += 1
+            raise AssertionError("remote current must not be read")
+
+        def call(self, verb: str, body: Any) -> dict[str, Any]:
+            self.protocol_calls += 1
+            raise AssertionError(f"remote {verb} must not be called")
+
+        def close(self) -> None:
+            pass
+
+    transport = NoContactTransport()
+    state = tmp_path / "state"
+    result = reconcile(
+        vault=vault,
+        state_dir=state,
+        transport=transport,  # type: ignore[arg-type]
+        source_revision="a" * 40,
+        image_digest="sha256:" + "b" * 64,
+        timeout_seconds=2,
+    )
+
+    assert result["outcome"] == "LOCAL_SOURCE_CHANGED"
+    assert result["retryable"] is True
+    assert transport.current_calls == 0
+    assert transport.protocol_calls == 0
+    assert not (state / "pending-attempt.json").exists()
+    assert not (state / "pending-submission.tar").exists()
+    assert (
+        strict_json_loads((state / "last-result.json").read_text(encoding="utf-8"))[
+            "outcome"
+        ]
+        == "LOCAL_SOURCE_CHANGED"
+    )
+
+
+def test_reconcile_withholds_commit_when_source_moves_while_candidate_builds(
+    tmp_path: Path,
+) -> None:
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    _write_vault(vault)
+    state = tmp_path / "state"
+    revision = "a" * 40
+    digest = "sha256:" + "b" * 64
+
+    class SourceMovingTransport:
+        request: dict[str, Any] | None = None
+        submit_calls = 0
+        status_calls = 0
+        commit_calls = 0
+
+        def current(self) -> dict[str, Any]:
+            return {
+                "schema_version": 2,
+                "current_deployment_id": "",
+                "snapshot_id": "",
+                "run_id": "",
+                "source_fingerprint": "",
+                "artifact_fingerprint": "",
+                "logical_fingerprint": "",
+                "homeops_version": "",
+                "source_revision": "",
+                "image_digest": "",
+                "snapshot_contract_version": "",
+                "build_contract_version": "",
+                "promoted_at": "",
+            }
+
+        def call(self, verb: str, body: Any) -> dict[str, Any]:
+            if verb == "submit":
+                payload = body.read()
+                self.submit_calls += 1
+                with tarfile.open(fileobj=io.BytesIO(payload), mode="r:") as archive:
+                    self.request = json.loads(
+                        archive.extractfile("request.json").read()
+                    )
+                return {
+                    "schema_version": 1,
+                    "protocol": RECEIVER_PROTOCOL,
+                    "outcome": "ACCEPTED",
+                    "request_id": self.request["request_id"],
+                    "retryable": False,
+                    "archive_sha256": hashlib.sha256(payload).hexdigest(),
+                }
+            if verb == "commit":
+                self.commit_calls += 1
+                raise AssertionError("commit must be withheld after source movement")
+            assert verb == "status"
+            assert self.request is not None
+            self.status_calls += 1
+            note = vault / "AI Context.md"
+            note.write_text(
+                note.read_text(encoding="utf-8") + "Changed during remote build.\n",
+                encoding="utf-8",
+            )
+            return {
+                "schema_version": 1,
+                "protocol": RECEIVER_PROTOCOL,
+                "outcome": "RESULT",
+                "request_id": self.request["request_id"],
+                "retryable": False,
+                "commit_accepted": False,
+                "result": {
+                    "schema_version": 1,
+                    "protocol": RECEIVER_PROTOCOL,
+                    "request_id": self.request["request_id"],
+                    "publisher_id": self.request["publisher_id"],
+                    "outcome": "CANDIDATE_READY",
+                    "candidate_deployment_id": "c" * 64,
+                    "expected_current_deployment_id": "",
+                    "snapshot_id": self.request["snapshot_id"],
+                    "run_id": "11111111-1111-4111-8111-111111111111",
+                    "release_policy_id": self.request["release_policy_id"],
+                    "promotion_policy_id": _policy_id(
+                        _release_policy("0.4.2", revision, digest)
+                    ),
+                    "retryable": False,
+                },
+            }
+
+        def close(self) -> None:
+            pass
+
+    transport = SourceMovingTransport()
+    result = reconcile(
+        vault=vault,
+        state_dir=state,
+        transport=transport,  # type: ignore[arg-type]
+        source_revision=revision,
+        image_digest=digest,
+        timeout_seconds=2,
+    )
+
+    assert result["outcome"] == "LOCAL_SOURCE_CHANGED"
+    assert result["retryable"] is True
+    assert transport.submit_calls == 1
+    assert transport.status_calls == 1
+    assert transport.commit_calls == 0
+    assert not (state / "pending-attempt.json").exists()
+    assert not (state / "pending-submission.tar").exists()
+    assert (
+        strict_json_loads((state / "last-result.json").read_text(encoding="utf-8"))[
+            "outcome"
+        ]
+        == "LOCAL_SOURCE_CHANGED"
     )
 
 
@@ -827,7 +1168,7 @@ def test_reconcile_reads_back_exact_promoted_release_identity(tmp_path: Path) ->
                 "source_fingerprint": self.manifest["source_fingerprint"],
                 "artifact_fingerprint": self.manifest["artifact_fingerprint"],
                 "logical_fingerprint": self.manifest["logical_fingerprint"],
-                "homeops_version": "0.4.1",
+                "homeops_version": "0.4.2",
                 "source_revision": revision,
                 "image_digest": digest,
                 "snapshot_contract_version": "homeops-snapshot-v1",
@@ -889,7 +1230,7 @@ def test_reconcile_reads_back_exact_promoted_release_identity(tmp_path: Path) ->
                                 "build_contract_version": "homeops-build-v1",
                                 "build_schema_version": 1,
                                 "evaluation_suite_sha256": [],
-                                "homeops_version": "0.4.1",
+                                "homeops_version": "0.4.2",
                                 "image_digest": digest,
                                 "schema_version": 1,
                                 "snapshot_contract_version": "homeops-snapshot-v1",
@@ -969,7 +1310,7 @@ def test_reconcile_resumes_exact_private_attempt_after_ambiguous_submit(
                 "source_fingerprint": self.manifest["source_fingerprint"],
                 "artifact_fingerprint": self.manifest["artifact_fingerprint"],
                 "logical_fingerprint": self.manifest["logical_fingerprint"],
-                "homeops_version": "0.4.1",
+                "homeops_version": "0.4.2",
                 "source_revision": revision,
                 "image_digest": digest,
                 "snapshot_contract_version": "homeops-snapshot-v1",
@@ -982,8 +1323,12 @@ def test_reconcile_resumes_exact_private_attempt_after_ambiguous_submit(
                 payload = body.read()
                 self.submits += 1
                 with tarfile.open(fileobj=io.BytesIO(payload), mode="r:") as archive:
-                    self.request = json.loads(archive.extractfile("request.json").read())
-                    self.manifest = json.loads(archive.extractfile("snapshot.json").read())
+                    self.request = json.loads(
+                        archive.extractfile("request.json").read()
+                    )
+                    self.manifest = json.loads(
+                        archive.extractfile("snapshot.json").read()
+                    )
                 if self.fail_first_submit:
                     self.fail_first_submit = False
                     raise TransportError("response lost after durable submit")
@@ -1006,7 +1351,7 @@ def test_reconcile_resumes_exact_private_attempt_after_ambiguous_submit(
                     "retryable": False,
                 }
             assert verb == "status"
-            policy = _release_policy("0.4.1", revision, digest)
+            policy = _release_policy("0.4.2", revision, digest)
             outcome = "PROMOTED" if self.committed else "CANDIDATE_READY"
             return {
                 "schema_version": 1,
@@ -1080,35 +1425,59 @@ def test_commit_requested_with_source_move_polls_terminal_without_reauthorizing(
 
     class DelayedCommitTransport:
         request: dict[str, Any] | None = None
+        manifest: dict[str, Any] | None = None
         ready_calls = 0
         commit_calls = 0
         current_calls = 0
+        terminal = False
+        deployment_id = "c" * 64
+        run_id = "11111111-1111-4111-8111-111111111111"
 
         def current(self) -> dict[str, Any]:
             self.current_calls += 1
-            if self.current_calls > 1:
-                raise AssertionError("current must not be reread before a terminal result")
+            if not self.terminal:
+                return {
+                    "schema_version": 2,
+                    "current_deployment_id": "",
+                    "snapshot_id": "",
+                    "run_id": "",
+                    "source_fingerprint": "",
+                    "artifact_fingerprint": "",
+                    "logical_fingerprint": "",
+                    "homeops_version": "",
+                    "source_revision": "",
+                    "image_digest": "",
+                    "snapshot_contract_version": "",
+                    "build_contract_version": "",
+                    "promoted_at": "",
+                }
+            assert self.manifest is not None
             return {
                 "schema_version": 2,
-                "current_deployment_id": "",
-                "snapshot_id": "",
-                "run_id": "",
-                "source_fingerprint": "",
-                "artifact_fingerprint": "",
-                "logical_fingerprint": "",
-                "homeops_version": "",
-                "source_revision": "",
-                "image_digest": "",
-                "snapshot_contract_version": "",
-                "build_contract_version": "",
-                "promoted_at": "",
+                "current_deployment_id": self.deployment_id,
+                "snapshot_id": self.manifest["snapshot_id"],
+                "run_id": self.run_id,
+                "source_fingerprint": self.manifest["source_fingerprint"],
+                "artifact_fingerprint": self.manifest["artifact_fingerprint"],
+                "logical_fingerprint": self.manifest["logical_fingerprint"],
+                "homeops_version": "0.4.2",
+                "source_revision": revision,
+                "image_digest": digest,
+                "snapshot_contract_version": "homeops-snapshot-v1",
+                "build_contract_version": "homeops-build-v1",
+                "promoted_at": "2026-08-13T12:05:00+00:00",
             }
 
         def call(self, verb: str, body: Any) -> dict[str, Any]:
             if verb == "submit":
                 payload = body.read()
                 with tarfile.open(fileobj=io.BytesIO(payload), mode="r:") as archive:
-                    self.request = json.loads(archive.extractfile("request.json").read())
+                    self.request = json.loads(
+                        archive.extractfile("request.json").read()
+                    )
+                    self.manifest = json.loads(
+                        archive.extractfile("snapshot.json").read()
+                    )
                 return {
                     "schema_version": 1,
                     "protocol": RECEIVER_PROTOCOL,
@@ -1129,6 +1498,7 @@ def test_commit_requested_with_source_move_polls_terminal_without_reauthorizing(
                 }
             assert verb == "status"
             self.ready_calls += 1
+            outcome = "PROMOTED" if self.terminal else "CANDIDATE_READY"
             return {
                 "schema_version": 1,
                 "protocol": RECEIVER_PROTOCOL,
@@ -1141,14 +1511,14 @@ def test_commit_requested_with_source_move_polls_terminal_without_reauthorizing(
                     "protocol": RECEIVER_PROTOCOL,
                     "request_id": self.request["request_id"],
                     "publisher_id": self.request["publisher_id"],
-                    "outcome": "CANDIDATE_READY",
-                    "candidate_deployment_id": "c" * 64,
+                    "outcome": outcome,
+                    "candidate_deployment_id": self.deployment_id,
                     "expected_current_deployment_id": "",
                     "snapshot_id": self.request["snapshot_id"],
-                    "run_id": "11111111-1111-4111-8111-111111111111",
+                    "run_id": self.run_id,
                     "release_policy_id": self.request["release_policy_id"],
                     "promotion_policy_id": _policy_id(
-                        _release_policy("0.4.1", revision, digest)
+                        _release_policy("0.4.2", revision, digest)
                     ),
                     "retryable": False,
                 },
@@ -1157,23 +1527,18 @@ def test_commit_requested_with_source_move_polls_terminal_without_reauthorizing(
         def close(self) -> None:
             pass
 
-    class StopPolling(RuntimeError):
-        pass
-
     transport = DelayedCommitTransport()
     original_poll = __import__("homeops_ai.pipeline", fromlist=["_poll"])._poll
-    stop_terminal = False
+    terminal_response_lost = False
 
-    def stop_terminal_poll(*args: Any, **kwargs: Any) -> dict[str, Any]:
-        nonlocal stop_terminal
-        if kwargs.get("terminal_only") and stop_terminal:
-            raise StopPolling("observed terminal-only recovery poll")
-        if kwargs.get("terminal_only"):
-            stop_terminal = True
+    def lose_first_terminal_response(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        nonlocal terminal_response_lost
+        if kwargs.get("terminal_only") and not terminal_response_lost:
+            terminal_response_lost = True
             raise TransportError("terminal response was lost after commit acceptance")
         return original_poll(*args, **kwargs)
 
-    monkeypatch.setattr("homeops_ai.pipeline._poll", stop_terminal_poll)
+    monkeypatch.setattr("homeops_ai.pipeline._poll", lose_first_terminal_response)
     initial = reconcile(
         vault=vault,
         state_dir=state,
@@ -1185,21 +1550,32 @@ def test_commit_requested_with_source_move_polls_terminal_without_reauthorizing(
     assert initial["outcome"] == "HOMEOPS_UNAVAILABLE"
     pending = _load_pending_attempt(state)
     assert pending is not None and pending["phase"] == "COMMIT_REQUESTED"
-    transport.request = pending["request"]
-    (vault / "AI Context.md").write_text("changed after commit acceptance", encoding="utf-8")
-    stop_terminal = True
+    (vault / "AI Context.md").write_text(
+        "changed after commit acceptance", encoding="utf-8"
+    )
+    transport.terminal = True
 
-    with pytest.raises(StopPolling):
-        _resume_pending_attempt(
-            vault=vault,
-            state_dir=state,
-            transport=transport,  # type: ignore[arg-type]
-            attempt=pending,
-            release_policy=_release_policy("0.4.1", revision, digest),
-            timeout_seconds=2,
-        )
+    resolved = reconcile(
+        vault=vault,
+        state_dir=state,
+        transport=transport,  # type: ignore[arg-type]
+        source_revision=revision,
+        image_digest=digest,
+        timeout_seconds=2,
+    )
+
+    assert resolved["outcome"] == "PROMOTED_SOURCE_MOVED"
+    assert resolved["retryable"] is True
     assert transport.commit_calls == 0
-    assert _load_pending_attempt(state)["phase"] == "COMMIT_REQUESTED"
+    assert transport.current_calls == 2
+    assert not (state / "pending-attempt.json").exists()
+    assert not (state / "pending-submission.tar").exists()
+    assert (
+        strict_json_loads((state / "last-result.json").read_text(encoding="utf-8"))[
+            "outcome"
+        ]
+        == "PROMOTED_SOURCE_MOVED"
+    )
 
 
 def test_applying_commit_journal_cannot_repromote_after_rollback(
@@ -1325,9 +1701,10 @@ def test_applying_commit_journal_cannot_repromote_after_rollback(
         image_digest=candidate["image_digest"],
     )
     assert result["outcomes"] == ["PROMOTION_CONFLICT"]
-    assert active_state(data)["current_deployment"]["deployment_id"] == expected[
-        "deployment_id"
-    ]
+    assert (
+        active_state(data)["current_deployment"]["deployment_id"]
+        == expected["deployment_id"]
+    )
     assert _commit_journal_path(root, publisher, request_id).is_file()
 
 
@@ -1362,7 +1739,7 @@ def test_commit_journal_repairs_bookkeeping_after_active_cas_crash(
     (data / "active.json").write_text(json.dumps(selected_expected), encoding="utf-8")
     deployment_path = data / "deployments" / f"{candidate['deployment_id']}.json"
     assert build_module.store_deployment(data, candidate) == deployment_path
-    policy = _release_policy("0.4.1", revision, digest)
+    policy = _release_policy("0.4.2", revision, digest)
     policy_id = _policy_id(policy)
     build_dir = data / "builds" / candidate["run_id"]
     build_dir.mkdir(parents=True)
@@ -1435,9 +1812,10 @@ def test_commit_journal_repairs_bookkeeping_after_active_cas_crash(
         (data / "deployment-history" / candidate["deployment_id"]).glob("*.json")
     )
     assert len(history) == 1
-    assert json.loads(history[0].read_text(encoding="utf-8")) == active_state(data)[
-        "current_deployment"
-    ]
+    assert (
+        json.loads(history[0].read_text(encoding="utf-8"))
+        == active_state(data)["current_deployment"]
+    )
     projection = json.loads(
         (root / "pipeline-state" / "current.json").read_text(encoding="utf-8")
     )

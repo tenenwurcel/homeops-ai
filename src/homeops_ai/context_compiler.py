@@ -9,8 +9,8 @@ from homeops_ai.query import (
     FORBIDDEN_GUIDANCE_STATUSES,
     QueryError,
     STOPWORDS,
-    build_manifest,
-    execute_query,
+    execute_query_for_manifest,
+    pinned_build_manifest,
 )
 
 
@@ -119,17 +119,18 @@ def compile_context(
     _validate_budgets(max_documents, max_sections, max_chars)
 
     retrieval_question = _retrieval_question(question)
-    manifest = build_manifest(data_dir, run_id)
     try:
-        retrieval = execute_query(
-            data_dir,
-            "context",
-            {"question": retrieval_question, "limit": "25"},
-            run_id=manifest["run_id"],
-        )
+        with pinned_build_manifest(data_dir, run_id) as manifest:
+            retrieval = execute_query_for_manifest(
+                manifest,
+                "context",
+                {"question": retrieval_question, "limit": "25"},
+            )
+            candidates = _candidate_sections(
+                retrieval["rows"], _section_bodies(manifest)
+            )
     except QueryError as error:
         raise ContextCompilerError(str(error)) from error
-    candidates = _candidate_sections(retrieval["rows"], _section_bodies(manifest))
 
     selected = []
     selected_documents: set[str] = set()
@@ -159,10 +160,18 @@ def compile_context(
             and document["document_type"] == "current-state"
         )
         required_for_trust = canonical_current_state and not has_canonical_current_state
-        if selected and not adds_terms and not required_for_trust and not exact_title_anchor:
+        if (
+            selected
+            and not adds_terms
+            and not required_for_trust
+            and not exact_title_anchor
+        ):
             omitted["redundant-evidence"] += 1
             continue
-        if document_id not in selected_documents and len(selected_documents) >= max_documents:
+        if (
+            document_id not in selected_documents
+            and len(selected_documents) >= max_documents
+        ):
             omitted["document-budget"] += 1
             continue
         if len(selected) >= max_sections:
@@ -186,7 +195,9 @@ def compile_context(
         selected.append(candidate)
         selected_documents.add(document_id)
         selected_terms.update(matched_terms)
-        has_canonical_current_state = has_canonical_current_state or canonical_current_state
+        has_canonical_current_state = (
+            has_canonical_current_state or canonical_current_state
+        )
         evidence_chars += candidate["char_count"]
 
     if not selected:
@@ -229,11 +240,15 @@ def compile_context(
         )
 
     documents = sorted(by_document.values(), key=lambda item: item["document_rank"])
-    warnings = ["Compiled evidence is documented state; no live verification was performed."]
+    warnings = [
+        "Compiled evidence is documented state; no live verification was performed."
+    ]
     if risk_level == "risky":
         warnings.append("Fresh live read-only discovery is required before mutation.")
     if any(document["authority"] != "canonical" for document in documents):
-        warnings.append("Supporting evidence is included and does not override canonical state.")
+        warnings.append(
+            "Supporting evidence is included and does not override canonical state."
+        )
     if omitted:
         warnings.append("Some ranked evidence was omitted by explicit bundle budgets.")
 
@@ -281,7 +296,9 @@ def compile_context(
         },
         "live_verification": {
             "required": risk_level == "risky",
-            "status": "required-before-mutation" if risk_level == "risky" else "not-required-by-request",
+            "status": "required-before-mutation"
+            if risk_level == "risky"
+            else "not-required-by-request",
             "known_verification_gaps": known_gaps,
         },
         "selection": {
@@ -299,4 +316,6 @@ def compile_context(
 
 def write_bundle(bundle: dict[str, Any], output: Path) -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(json.dumps(bundle, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    output.write_text(
+        json.dumps(bundle, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )

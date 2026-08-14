@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 import re
+import stat
 import tempfile
 from contextlib import contextmanager
 from copy import deepcopy
@@ -144,7 +145,9 @@ def durable_create_json(path: Path, value: Any, *, mode: int = 0o600) -> None:
         descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
     except FileExistsError:
         if path.read_bytes() != encoded:
-            raise DeploymentError(f"immutable record already exists with other bytes: {path}")
+            raise DeploymentError(
+                f"immutable record already exists with other bytes: {path}"
+            )
         return
     try:
         with os.fdopen(descriptor, "wb") as stream:
@@ -158,22 +161,46 @@ def durable_create_json(path: Path, value: Any, *, mode: int = 0o600) -> None:
 
 
 @contextmanager
-def deployment_lock(data_dir: Path, *, blocking: bool = False) -> Iterator[None]:
-    """Hold the kernel-backed lock shared by build, promote, rollback, and cleanup."""
-
+def _data_lock(
+    data_dir: Path,
+    name: str,
+    *,
+    blocking: bool = False,
+    shared: bool = False,
+    create: bool = True,
+    record_owner: bool = False,
+) -> Iterator[None]:
+    if data_dir.is_symlink():
+        raise DeploymentError("deployment data directory must not be a symlink")
     data = data_dir.resolve()
-    data.mkdir(parents=True, exist_ok=True, mode=0o700)
-    lock_path = data / "deployment.lock"
-    descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
-    operation = fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB)
+    if create:
+        data.mkdir(parents=True, exist_ok=True, mode=0o700)
+    elif not data.is_dir():
+        raise DeploymentError(f"deployment data directory does not exist: {data}")
+    lock_path = data / name
+    flags = os.O_RDWR | os.O_CREAT if create else os.O_RDONLY
+    flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    try:
+        descriptor = os.open(lock_path, flags, 0o600)
+    except OSError as error:
+        raise DeploymentError(f"cannot open deployment lock: {lock_path}") from error
+    if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+        os.close(descriptor)
+        raise DeploymentError(f"deployment lock is not a regular file: {lock_path}")
+    operation = (fcntl.LOCK_SH if shared else fcntl.LOCK_EX) | (
+        0 if blocking else fcntl.LOCK_NB
+    )
     try:
         try:
             fcntl.flock(descriptor, operation)
         except BlockingIOError as error:
-            raise DeploymentError(f"another HomeOps operation holds {lock_path}") from error
-        os.ftruncate(descriptor, 0)
-        os.write(descriptor, f"{os.getpid()}\n".encode("ascii"))
-        os.fsync(descriptor)
+            raise DeploymentError(
+                f"another HomeOps operation holds {lock_path}"
+            ) from error
+        if record_owner and not shared and create:
+            os.ftruncate(descriptor, 0)
+            os.write(descriptor, f"{os.getpid()}\n".encode("ascii"))
+            os.fsync(descriptor)
         yield
     finally:
         try:
@@ -182,13 +209,141 @@ def deployment_lock(data_dir: Path, *, blocking: bool = False) -> Iterator[None]
             os.close(descriptor)
 
 
+@contextmanager
+def deployment_lock(
+    data_dir: Path,
+    *,
+    blocking: bool = False,
+    shared: bool = False,
+    create: bool = True,
+) -> Iterator[None]:
+    """Hold the kernel-backed lock shared by deployment mutations."""
+
+    with _data_lock(
+        data_dir,
+        "deployment.lock",
+        blocking=blocking,
+        shared=shared,
+        create=create,
+        record_owner=True,
+    ):
+        yield
+
+
+@contextmanager
+def retention_lock(
+    data_dir: Path,
+    *,
+    blocking: bool = True,
+    shared: bool = False,
+    create: bool = True,
+) -> Iterator[None]:
+    """Serialize cleanup handoff without blocking build or promotion work.
+
+    Readers take this lock shared only until their per-run shared lock is held.
+    A future cleanup implementation must acquire locks in this order:
+    retention exclusive, deployment exclusive, then run exclusive.
+    """
+
+    with _data_lock(
+        data_dir,
+        "retention.lock",
+        blocking=blocking,
+        shared=shared,
+        create=create,
+    ):
+        yield
+
+
+def run_pin_path(data_dir: Path, run_id: str) -> Path:
+    """Return the fixed advisory-lock path for one immutable build run."""
+
+    safe_id = validate_safe_id(run_id, "run_id")
+    if data_dir.is_symlink():
+        raise DeploymentError("deployment data directory must not be a symlink")
+    data = data_dir.resolve()
+    pins = data / "run-pins"
+    try:
+        pins_mode = pins.lstat().st_mode
+    except FileNotFoundError:
+        pass
+    except OSError as error:
+        raise DeploymentError(f"cannot inspect run pin directory: {pins}") from error
+    else:
+        if not stat.S_ISDIR(pins_mode):
+            raise DeploymentError(f"run pin directory is not a directory: {pins}")
+    return pins / f"{safe_id}.lock"
+
+
+@contextmanager
+def run_pin(
+    data_dir: Path,
+    run_id: str,
+    *,
+    exclusive: bool = False,
+    blocking: bool = True,
+) -> Iterator[None]:
+    """Pin one run while it is being read, or exclusively reserve it for cleanup."""
+
+    path = run_pin_path(data_dir, run_id)
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags, 0o600)
+    if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+        os.close(descriptor)
+        raise DeploymentError(f"run pin is not a regular file: {path}")
+    operation = (fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH) | (
+        0 if blocking else fcntl.LOCK_NB
+    )
+    try:
+        try:
+            fcntl.flock(descriptor, operation)
+        except BlockingIOError as error:
+            raise DeploymentError(f"run is pinned: {run_id}") from error
+        yield
+    finally:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
+
+
+def run_is_pinned(data_dir: Path, run_id: str) -> bool:
+    """Probe an existing run lock without creating retention state."""
+
+    path = run_pin_path(data_dir, run_id)
+    if not os.path.lexists(path):
+        return False
+    if path.is_symlink() or not path.is_file():
+        raise DeploymentError(f"run pin is not a regular file: {path}")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise DeploymentError(f"cannot inspect run pin: {path}") from error
+    if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+        os.close(descriptor)
+        raise DeploymentError(f"run pin is not a regular file: {path}")
+    try:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        return False
+    finally:
+        os.close(descriptor)
+
+
 def validate_safe_id(value: Any, field: str) -> str:
     if not isinstance(value, str) or not _SAFE_ID.fullmatch(value):
         raise DeploymentError(f"{field} is not a safe identifier")
     return value
 
 
-def _require_string(record: dict[str, Any], field: str, *, nullable: bool = False) -> str | None:
+def _require_string(
+    record: dict[str, Any], field: str, *, nullable: bool = False
+) -> str | None:
     value = record.get(field)
     if nullable and value is None:
         return None
@@ -278,7 +433,11 @@ def validate_deployment_record(record: Any) -> dict[str, Any]:
         _require_string(record, field)
     _require_string(record, "promoted_at", nullable=True)
     for field in ("snapshot_schema_version", "build_schema_version"):
-        if not isinstance(record[field], int) or isinstance(record[field], bool) or record[field] < 1:
+        if (
+            not isinstance(record[field], int)
+            or isinstance(record[field], bool)
+            or record[field] < 1
+        ):
             raise DeploymentError(f"deployment {field} must be a positive integer")
     if record["result"] != "verified":
         raise DeploymentError("only verified deployments may be selected")
@@ -373,19 +532,27 @@ def validate_state(state: Any, *, allow_legacy: bool = True) -> dict[str, Any]:
     current_record = state["current_deployment"]
     previous_record = state["previous_deployment"]
     if current_record is None:
-        if state["current"] is not None or previous_record is not None or state["previous"] is not None:
+        if (
+            state["current"] is not None
+            or previous_record is not None
+            or state["previous"] is not None
+        ):
             raise DeploymentError("empty active state contains a selected deployment")
     else:
         current_record = validate_deployment_record(current_record)
         if state["current"] != current_record["run_id"]:
-            raise DeploymentError("legacy current run ID disagrees with current deployment")
+            raise DeploymentError(
+                "legacy current run ID disagrees with current deployment"
+            )
     if previous_record is None:
         if state["previous"] is not None:
             raise DeploymentError("previous run ID has no previous deployment")
     else:
         previous_record = validate_deployment_record(previous_record)
         if state["previous"] != previous_record["run_id"]:
-            raise DeploymentError("legacy previous run ID disagrees with previous deployment")
+            raise DeploymentError(
+                "legacy previous run ID disagrees with previous deployment"
+            )
     promoted_at = state["promoted_at"]
     if promoted_at is not None and not isinstance(promoted_at, str):
         raise DeploymentError("active promoted_at must be a string or null")
@@ -402,7 +569,9 @@ def load_state(data_dir: Path, *, allow_legacy: bool = True) -> dict[str, Any]:
     try:
         parsed = strict_json_loads(path.read_text(encoding="utf-8"))
     except (OSError, DeploymentError) as error:
-        raise DeploymentError(f"cannot read active deployment state: {error}") from error
+        raise DeploymentError(
+            f"cannot read active deployment state: {error}"
+        ) from error
     return validate_state(parsed, allow_legacy=allow_legacy)
 
 
@@ -427,7 +596,9 @@ def load_deployment(data_dir: Path, deployment_id: str) -> dict[str, Any]:
             strict_json_loads(path.read_text(encoding="utf-8"))
         )
     except DeploymentError as error:
-        raise DeploymentError(f"deployment record is invalid: {deployment_id}: {error}") from error
+        raise DeploymentError(
+            f"deployment record is invalid: {deployment_id}: {error}"
+        ) from error
 
 
 def select_deployment(
@@ -468,7 +639,9 @@ def rollback_transition(state: dict[str, Any], *, promoted_at: str) -> dict[str,
     current = selected["current_deployment"]
     previous = selected["previous_deployment"]
     if current is None or previous is None:
-        raise DeploymentError("rollback requires current and previous verified deployments")
+        raise DeploymentError(
+            "rollback requires current and previous verified deployments"
+        )
     selected_previous = deepcopy(previous)
     selected_previous["promoted_at"] = promoted_at
     rolled_back = {
@@ -580,7 +753,9 @@ def current_projection(state: dict[str, Any]) -> dict[str, Any]:
         "snapshot_id": deployment["snapshot_id"] if deployment else "",
         "run_id": deployment["run_id"] if deployment else "",
         "source_fingerprint": deployment["source_fingerprint"] if deployment else "",
-        "artifact_fingerprint": deployment["artifact_fingerprint"] if deployment else "",
+        "artifact_fingerprint": deployment["artifact_fingerprint"]
+        if deployment
+        else "",
         "logical_fingerprint": deployment["logical_fingerprint"] if deployment else "",
         "homeops_version": deployment["homeops_version"] if deployment else "",
         "source_revision": deployment["source_revision"] if deployment else "",
