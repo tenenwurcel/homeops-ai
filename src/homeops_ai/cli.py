@@ -241,8 +241,9 @@ def build_parser() -> argparse.ArgumentParser:
     compile_parser.add_argument("--output", type=Path)
 
     mcp = subparsers.add_parser("mcp", help="run the read-only MCP server")
-    mcp.add_argument("--data-dir", type=Path, default=Path("data"))
-    mcp.add_argument("--transport", choices=("stdio",), default="stdio")
+    from homeops_ai.mcp_server import add_mcp_arguments
+
+    add_mcp_arguments(mcp)
 
     pipeline = subparsers.add_parser(
         "pipeline", help="coordinate or process transactional snapshot deployments"
@@ -308,9 +309,15 @@ def main() -> None:
     args = build_parser().parse_args()
 
     if args.command == "mcp":
-        from homeops_ai.mcp_server import create_server
+        from homeops_ai.mcp_server import (
+            MCPServerConfigurationError,
+            run_server_from_args,
+        )
 
-        create_server(args.data_dir).run(transport=args.transport)
+        try:
+            run_server_from_args(args)
+        except MCPServerConfigurationError as error:
+            raise SystemExit(str(error)) from error
         return
 
     if args.command == "smoke":

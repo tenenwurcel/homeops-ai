@@ -116,9 +116,9 @@ uv run homeops-ai evaluate \
 
 ## Read-Only MCP Server
 
-HomeOps can expose the verified build through a stdio MCP server. The server
-does not listen on a network socket and all tools call the existing stable
-read-only query and context-compiler APIs.
+HomeOps can expose the verified build through a stdio MCP server. This remains
+the default transport, does not listen on a network socket, and calls only the
+existing stable read-only query and context-compiler APIs.
 
 ```bash
 uv run homeops-ai-mcp --data-dir data
@@ -130,6 +130,30 @@ container image because its entrypoint is `homeops-ai`:
 ```bash
 uv run homeops-ai mcp --data-dir data
 ```
+
+For a conventional remote MCP deployment, the same server can use authenticated
+Streamable HTTP. HTTP mode cannot start without an HTTPS issuer, canonical MCP
+resource/audience, and a local asymmetric public JWKS. The production launcher
+uses a private Unix socket so the HomeOps container still needs no network:
+
+```bash
+uv run homeops-ai mcp \
+  --transport streamable-http \
+  --data-dir data \
+  --unix-socket /run/homeops-mcp/mcp.sock \
+  --issuer-url https://auth.example.test/application/o/homeops-mcp/ \
+  --resource-url https://mcp.example.test/mcp \
+  --audience https://mcp.example.test/mcp \
+  --jwks-file /var/lib/homeops-ai/oauth-jwks.json
+```
+
+The access token must be an RS256 JWT whose only audience is the canonical
+resource URL and whose `scope` includes `homeops:read`. The JWKS is loaded once
+at startup and must contain only public RSA verification keys; deploy a
+validated replacement and restart the service for key rotation. The MCP route
+is `/mcp`, RFC 9728 metadata is published at
+`/.well-known/oauth-protected-resource/mcp`, and `/healthz` contains only a
+non-sensitive liveness result.
 
 The MCP surface is intentionally small:
 
