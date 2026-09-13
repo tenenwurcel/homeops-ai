@@ -760,7 +760,7 @@ def test_authenticated_writable_http_requires_write_scope_and_subject(
 
                             request_id = str(uuid.uuid4())
                             captured = await session.call_tool(
-                                "capture_note",
+                                "homeops.capture_note",
                                 {
                                     "request_id": request_id,
                                     "title": "Cross-device capture",
@@ -781,7 +781,7 @@ def test_authenticated_writable_http_requires_write_scope_and_subject(
 
                             rebuild(vault, data)
                             status = await session.call_tool(
-                                "write_status", {"request_id": request_id}
+                                "homeops.write_status", {"request_id": request_id}
                             )
                             assert status.isError is False
                             assert status.structuredContent["outcome"] == "APPLIED"

@@ -6,7 +6,7 @@ import signal
 import socket
 import stat
 import threading
-from collections.abc import Generator
+from collections.abc import Generator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -25,7 +25,7 @@ from mcp.server.auth.routes import (
 from mcp.server.auth.settings import AuthSettings
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
-from mcp.types import ToolAnnotations
+from mcp.types import ContentBlock, ToolAnnotations
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
@@ -84,6 +84,10 @@ CREATE_ANNOTATIONS = ToolAnnotations(
     idempotentHint=True,
     openWorldHint=False,
 )
+OPENAI_CONNECTED_APP_TOOL_ALIASES = {
+    "homeops.capture_note": "capture_note",
+    "homeops.write_status": "write_status",
+}
 
 
 class MCPToolError(RuntimeError):
@@ -139,6 +143,13 @@ class _HomeOpsFastMCP(FastMCP):
     ) -> None:
         super().__init__(*args, **kwargs)
         self._advertised_scopes = advertised_scopes
+
+    async def call_tool(
+        self, name: str, arguments: dict[str, Any]
+    ) -> Sequence[ContentBlock] | dict[str, Any]:
+        """Accept qualified write names emitted by OpenAI connected apps."""
+        canonical_name = OPENAI_CONNECTED_APP_TOOL_ALIASES.get(name, name)
+        return await super().call_tool(canonical_name, arguments)
 
     def streamable_http_app(self) -> Any:
         app = super().streamable_http_app()

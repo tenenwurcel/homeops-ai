@@ -1,6 +1,6 @@
 [project]
 name = "homeops-ai"
-version = "0.6.3"
+version = "0.6.4"
 description = "Evidence-backed HomeOps knowledge platform"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
