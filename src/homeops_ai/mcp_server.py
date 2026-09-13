@@ -491,14 +491,14 @@ def compile_context_bundle(
 
 
 def _write_principal(config: MCPWriteConfig) -> tuple[str, str]:
-    access_token = get_access_token()
+    verified_identity = get_access_token()
     if (
-        access_token is None
-        or config.required_scope not in access_token.scopes
-        or access_token.subject not in config.allowed_subjects
+        verified_identity is None
+        or config.required_scope not in verified_identity.scopes
+        or verified_identity.subject not in config.allowed_subjects
     ):
         raise MCPToolError("write access is not authorized")
-    return access_token.subject, access_token.client_id
+    return verified_identity.subject, verified_identity.client_id
 
 
 def _publication_status(
