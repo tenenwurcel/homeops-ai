@@ -22,6 +22,7 @@ from homeops_ai.build import (
     active_state,
     evaluate_candidate,
     inspect_vault,
+    materialize_snapshot,
     promote,
     recover_pending_rollback,
     repair_selected_bookkeeping,
@@ -40,6 +41,7 @@ from homeops_ai.deployment import (
     validate_deployment_record,
     validate_safe_id,
 )
+from homeops_ai.evaluation import EvaluationError
 from homeops_ai.source_contract import export_snapshot
 from homeops_ai.snapshot import (
     RECEIVER_PROTOCOL,
@@ -273,6 +275,201 @@ def export_candidate(
     )
     verify_snapshot(destination, manifest)
     return manifest, before
+
+
+def reconcile_local(
+    vault: Path,
+    root: Path,
+    state_dir: Path,
+    *,
+    source_revision: str | None,
+    image_digest: str | None,
+    evaluation_cases: Sequence[Path] = (),
+    quiescence_seconds: float = 10.0,
+    sleep: Callable[[float], None] = time.sleep,
+) -> dict[str, Any]:
+    """Build and promote a quiescent local synced vault without SSH ingress."""
+
+    if not 0 <= quiescence_seconds <= 300:
+        raise PipelineError(
+            "INTERNAL_ERROR",
+            "quiescence_seconds must be between 0 and 300",
+        )
+    root = root.resolve()
+    state_dir = state_dir.resolve()
+    result: dict[str, Any]
+    try:
+        with local_pipeline_lock(state_dir):
+            homeops_version, released_revision, released_digest = _released_identity(
+                source_revision,
+                image_digest,
+            )
+            first = inspect_vault(vault)
+            if first["validation"]["errors"]:
+                raise PipelineError(
+                    "LOCAL_VAULT_INVALID",
+                    "synced vault validation failed",
+                )
+            if quiescence_seconds:
+                sleep(quiescence_seconds)
+            second = inspect_vault(vault)
+            if second["validation"]["errors"] or not _same_identity(first, second):
+                raise PipelineError(
+                    "LOCAL_SOURCE_CHANGED",
+                    "synced vault did not remain quiescent",
+                    retryable=True,
+                )
+
+            candidates = state_dir / "candidates"
+            candidates.mkdir(parents=True, exist_ok=True, mode=0o700)
+            with tempfile.TemporaryDirectory(prefix="local.", dir=candidates) as temporary:
+                exported = Path(temporary) / "vault"
+                manifest, _ = export_candidate(
+                    vault,
+                    exported,
+                    source_revision=released_revision,
+                )
+                if not _same_identity(second, manifest):
+                    raise PipelineError(
+                        "LOCAL_SOURCE_CHANGED",
+                        "synced vault changed after the quiescence check",
+                        retryable=True,
+                    )
+                state = active_state(root / "data")
+                current = state.get("current_deployment")
+                if current is not None and all(
+                    current.get(field) == manifest[field]
+                    for field in (
+                        "snapshot_id",
+                        "source_fingerprint",
+                        "artifact_fingerprint",
+                        "logical_fingerprint",
+                    )
+                ) and all(
+                    current.get(field) == expected
+                    for field, expected in (
+                        ("homeops_version", homeops_version),
+                        ("source_revision", released_revision),
+                        ("image_digest", released_digest),
+                    )
+                ):
+                    result = _result(
+                        "UNCHANGED",
+                        retryable=False,
+                        deployment_id=current["deployment_id"],
+                        snapshot_id=current["snapshot_id"],
+                        run_id=current["run_id"],
+                    )
+                else:
+                    expected_current = (
+                        current["deployment_id"] if current is not None else None
+                    )
+                    try:
+                        snapshot_dir = materialize_snapshot(root, exported, manifest)
+                        built = rebuild(
+                            snapshot_dir / "vault",
+                            root / "data",
+                            promote=False,
+                            snapshot_manifest=manifest,
+                            snapshot_received_at=utc_now(),
+                            homeops_version=homeops_version,
+                            source_revision=released_revision,
+                            image_digest=released_digest,
+                            expected_current_deployment_id=expected_current,
+                        )
+                    except (BuildError, DeploymentError, SnapshotError, OSError) as error:
+                        raise PipelineError(
+                            "BUILD_FAILED",
+                            _redacted_failure(error),
+                            retryable=True,
+                        ) from error
+                    deployment = built.get("deployment")
+                    if not isinstance(deployment, dict):
+                        raise PipelineError(
+                            "BUILD_FAILED",
+                            "local build did not produce a deployment record",
+                        )
+                    try:
+                        evaluation = evaluate_candidate(
+                            root / "data",
+                            built["run_id"],
+                            cases=list(evaluation_cases),
+                        )
+                    except (BuildError, EvaluationError, OSError, ValueError) as error:
+                        raise PipelineError(
+                            "EVALUATION_FAILED",
+                            _redacted_failure(error),
+                        ) from error
+                    if not evaluation.get("passed"):
+                        raise PipelineError(
+                            "EVALUATION_FAILED",
+                            "local candidate failed promotion-safe evaluation",
+                        )
+
+                    current_source = inspect_vault(vault)
+                    if current_source["validation"]["errors"] or not _same_identity(
+                        current_source,
+                        manifest,
+                    ):
+                        raise PipelineError(
+                            "PROMOTED_SOURCE_MOVED",
+                            "synced vault moved before candidate promotion",
+                            retryable=True,
+                        )
+                    selected = active_state(root / "data").get(
+                        "current_deployment"
+                    )
+                    actual_current = (
+                        selected["deployment_id"] if selected is not None else None
+                    )
+                    if actual_current != expected_current:
+                        raise PipelineError(
+                            "PROMOTION_CONFLICT",
+                            "active deployment moved before local promotion",
+                            retryable=True,
+                        )
+                    try:
+                        promoted = promote(
+                            root / "data",
+                            deployment,
+                            expected_current_deployment_id=expected_current,
+                        )
+                        verified = verify_active(root)
+                    except (BuildError, DeploymentError, SnapshotError, OSError) as error:
+                        raise PipelineError(
+                            "POST_PROMOTION_MISMATCH",
+                            _redacted_failure(error),
+                        ) from error
+                    result = _result(
+                        "PROMOTED",
+                        retryable=False,
+                        deployment_id=deployment["deployment_id"],
+                        snapshot_id=deployment["snapshot_id"],
+                        run_id=deployment["run_id"],
+                        promotion=promoted["result"],
+                        verification=verified["outcome"],
+                    )
+    except PipelineError as error:
+        result = _result(
+            error.outcome,
+            retryable=error.retryable,
+            diagnostic=_redacted_failure(error),
+        )
+    except (
+        BuildError,
+        DeploymentError,
+        EvaluationError,
+        SnapshotError,
+        OSError,
+        ValueError,
+    ) as error:
+        result = _result(
+            "INTERNAL_ERROR",
+            retryable=True,
+            diagnostic=_redacted_failure(error),
+        )
+    _write_last_result(state_dir, result)
+    return result
 
 
 @contextmanager

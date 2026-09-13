@@ -3,7 +3,7 @@ from pathlib import Path
 from homeops_ai.build import rebuild
 from homeops_ai.context_compiler import ContextCompilerError, compile_context
 from homeops_ai.evaluation import evaluate_suite
-from homeops_ai.query import execute_query
+from homeops_ai.query import QueryError, execute_query
 import pytest
 
 
@@ -84,6 +84,24 @@ def test_stable_queries_cover_graph_and_context(tmp_path: Path) -> None:
         "AI Context.md",
         "Heavy VM.md",
     }
+
+    by_id = execute_query(
+        data,
+        "document-by-id",
+        {"document_id": "22222222-2222-4222-8222-222222222222"},
+    )
+    assert by_id["rows"] == [
+        {
+            "document_id": "22222222-2222-4222-8222-222222222222",
+            "source_path": "Heavy VM.md",
+            "title": "Heavy VM",
+            "document_type": "current-state",
+            "status": "current",
+            "authority": "canonical",
+        }
+    ]
+    with pytest.raises(QueryError, match="canonical UUID"):
+        execute_query(data, "document-by-id", {"document_id": "not-a-uuid"})
 
     links = execute_query(data, "links-to", {"title": "Heavy VM"})
     assert {row["source_path"] for row in links["rows"]} == {

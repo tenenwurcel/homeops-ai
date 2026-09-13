@@ -114,7 +114,7 @@ uv run homeops-ai evaluate \
   --output data/evaluation/context-compiler-v1.json
 ```
 
-## Read-Only MCP Server
+## MCP Server
 
 HomeOps can expose the verified build through a stdio MCP server. This remains
 the default transport, does not listen on a network socket, and calls only the
@@ -155,6 +155,53 @@ is `/mcp`, RFC 9728 metadata is published at
 `/.well-known/oauth-protected-resource/mcp`, and `/healthz` contains only a
 non-sensitive liveness result.
 
+Writable MCP is an explicit HTTP-only mode. The MCP process still receives no
+vault mount and needs no network: it sends one bounded request over a private
+Unix socket to a separate broker. The broker is create-only, validates the
+complete candidate vault, durably records the request, and atomically publishes
+a new root Markdown note. It has no edit, rename, delete, shell, or direct Cozo
+operation.
+
+Run the broker under the dedicated vault-writer identity. Its state directory
+must be private and outside the synced vault:
+
+```bash
+uv run homeops-ai write-broker \
+  --vault /var/lib/homeops/vault \
+  --state-dir /var/lib/homeops-write-broker \
+  --unix-socket /run/homeops-write-broker/broker.sock \
+  --socket-group homeops-mcp \
+  --allowed-subject '<exact OAuth subject>'
+```
+
+Then opt the authenticated MCP process into those tools:
+
+```bash
+uv run homeops-ai mcp \
+  --transport streamable-http \
+  --data-dir data \
+  --unix-socket /run/homeops-mcp/mcp.sock \
+  --issuer-url https://auth.example.test/application/o/homeops-mcp/ \
+  --resource-url https://mcp.example.test/mcp \
+  --audience https://mcp.example.test/mcp \
+  --jwks-file /var/lib/homeops-ai/oauth-jwks.json \
+  --write-broker-socket /run/homeops-write-broker/broker.sock \
+  --write-subject '<exact OAuth subject>'
+```
+
+Writable mode advertises and requires both `homeops:read` and `homeops:write`.
+The write tools also enforce the exact configured token subject. Keep write
+approval enabled in the MCP client and never submit secrets. A `capture_note`
+call requires a canonical UUIDv4 `request_id`; retrying the same ID with the
+same content is idempotent, while different content is rejected. Captures are
+supporting `reference` notes tagged `mcp-capture`, not canonical instructions.
+`write_status` never retries or publishes a pending write. If a capture remains
+`ACCEPTED` with `awaiting-capture-retry`, invoke `capture_note` again with the
+same request ID and identical content through the normal write-approval path.
+`publication.state = active` proves only that the note reached the local
+verified HomeOps build. The MCP deliberately does not inspect Headless Sync
+credentials or claim delivery to another Obsidian device.
+
 The MCP surface is intentionally small:
 
 - `build_status`: active verified build metadata, counts, validation, and
@@ -163,6 +210,10 @@ The MCP surface is intentionally small:
   bounded row count.
 - `context_bundle`: deterministic evidence bundle compilation. Risk is explicit;
   risky bundles still require fresh live read-only discovery before mutation.
+- `capture_note` (opt-in): create one validated supporting note; it is annotated
+  as a non-destructive write so capable clients can require confirmation.
+- `write_status` (opt-in): read-only reporting of durable broker state and
+  whether the captured document has reached the active verified build.
 
 ## Automatic Transactional Pipeline
 

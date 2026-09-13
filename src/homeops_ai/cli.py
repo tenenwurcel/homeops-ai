@@ -43,6 +43,7 @@ from homeops_ai.pipeline import (
     process_remote,
     publish_current_status,
     reconcile,
+    reconcile_local,
     verify_active,
 )
 from homeops_ai.snapshot import SnapshotError
@@ -240,10 +241,17 @@ def build_parser() -> argparse.ArgumentParser:
     compile_parser.add_argument("--run-id")
     compile_parser.add_argument("--output", type=Path)
 
-    mcp = subparsers.add_parser("mcp", help="run the read-only MCP server")
+    mcp = subparsers.add_parser("mcp", help="run the HomeOps MCP server")
     from homeops_ai.mcp_server import add_mcp_arguments
 
     add_mcp_arguments(mcp)
+
+    write_broker = subparsers.add_parser(
+        "write-broker", help="run the private validated vault write broker"
+    )
+    from homeops_ai.write_broker import add_write_broker_arguments
+
+    add_write_broker_arguments(write_broker)
 
     pipeline = subparsers.add_parser(
         "pipeline", help="coordinate or process transactional snapshot deployments"
@@ -268,6 +276,26 @@ def build_parser() -> argparse.ArgumentParser:
         "--image-digest", default=os.environ.get("HOMEOPS_IMAGE_DIGEST")
     )
     reconcile_parser.add_argument("--timeout-seconds", type=int, default=900)
+
+    local_reconcile_parser = pipeline_subparsers.add_parser(
+        "reconcile-local",
+        help="build and promote a quiescent local synced vault",
+    )
+    local_reconcile_parser.add_argument("--vault", type=Path, required=True)
+    local_reconcile_parser.add_argument("--root", type=Path, required=True)
+    local_reconcile_parser.add_argument("--state-dir", type=Path, required=True)
+    local_reconcile_parser.add_argument(
+        "--source-revision", default=os.environ.get("HOMEOPS_SOURCE_REVISION")
+    )
+    local_reconcile_parser.add_argument(
+        "--image-digest", default=os.environ.get("HOMEOPS_IMAGE_DIGEST")
+    )
+    local_reconcile_parser.add_argument(
+        "--evaluation", type=Path, action="append", default=[]
+    )
+    local_reconcile_parser.add_argument(
+        "--quiescence-seconds", type=float, default=10.0
+    )
 
     process_parser = pipeline_subparsers.add_parser(
         "process", help="process immutable incoming candidates and commit markers"
@@ -320,6 +348,18 @@ def main() -> None:
             raise SystemExit(str(error)) from error
         return
 
+    if args.command == "write-broker":
+        from homeops_ai.write_broker import (
+            WriteBrokerConfigurationError,
+            run_write_broker_from_args,
+        )
+
+        try:
+            run_write_broker_from_args(args)
+        except WriteBrokerConfigurationError as error:
+            raise SystemExit(str(error)) from error
+        return
+
     if args.command == "smoke":
         if args.database is not None:
             args.database.parent.mkdir(parents=True, exist_ok=True)
@@ -344,6 +384,16 @@ def main() -> None:
                     source_revision=args.source_revision,
                     image_digest=args.image_digest,
                     timeout_seconds=args.timeout_seconds,
+                )
+            elif args.pipeline_command == "reconcile-local":
+                result = reconcile_local(
+                    vault=args.vault,
+                    root=args.root,
+                    state_dir=args.state_dir,
+                    source_revision=args.source_revision,
+                    image_digest=args.image_digest,
+                    evaluation_cases=args.evaluation,
+                    quiescence_seconds=args.quiescence_seconds,
                 )
             elif args.pipeline_command == "process":
                 result = process_remote(

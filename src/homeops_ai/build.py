@@ -429,6 +429,16 @@ def _materialize_snapshot(
     return destination
 
 
+def materialize_snapshot(
+    root: Path,
+    source_vault: Path,
+    manifest: dict[str, Any],
+) -> Path:
+    """Durably publish one verified immutable snapshot under ``root``."""
+
+    return _materialize_snapshot(root, source_vault, manifest)
+
+
 def _legacy_record(
     data: Path,
     run_id: str,

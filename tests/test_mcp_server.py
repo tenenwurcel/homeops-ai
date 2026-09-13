@@ -2,8 +2,11 @@ import json
 import stat
 import subprocess
 import sys
+import threading
 import time
+import uuid
 from pathlib import Path
+from types import SimpleNamespace
 
 import anyio
 import httpx
@@ -18,10 +21,12 @@ from homeops_ai.build import active_state, inspect_vault, rebuild
 from homeops_ai.mcp_server import (
     HTTPAuthConfig,
     MAX_MCP_ROWS,
+    MCPWriteConfig,
     MCPServerConfigurationError,
     MCPToolError,
     OfflineJWKSTokenVerifier,
     _prepare_unix_socket,
+    _write_config_from_args,
     compile_context_bundle,
     create_server,
     get_build_status,
@@ -29,6 +34,7 @@ from homeops_ai.mcp_server import (
 )
 from homeops_ai.snapshot import create_snapshot_manifest, write_manifest
 from homeops_ai.source_contract import export_snapshot
+from homeops_ai.write_broker import UnixWriteBrokerServer, VaultWriteBroker
 
 
 ISSUER_URL = "https://auth.example.test/application/o/homeops-mcp/"
@@ -620,6 +626,217 @@ def test_authenticated_streamable_http_lists_and_calls_read_only_tools(
                         assert result.structuredContent["result"] == "verified"
 
     anyio.run(run_authenticated_smoke)
+
+
+def test_authenticated_writable_http_requires_write_scope_and_subject(
+    tmp_path: Path,
+) -> None:
+    data = _build_data(tmp_path)
+    vault = tmp_path / "vault"
+    config, signing_key = _auth_material(tmp_path)
+    state = tmp_path / "write-state"
+    state.mkdir(mode=0o700)
+    runtime = tmp_path / "write-runtime"
+    runtime.mkdir(mode=0o700)
+    socket_path = runtime / "broker.sock"
+    broker = VaultWriteBroker(vault, state, allowed_subjects=("test-user",))
+    broker_server = UnixWriteBrokerServer(socket_path, broker)
+    broker_thread = threading.Thread(
+        target=broker_server.serve_forever,
+        daemon=True,
+    )
+    broker_thread.start()
+    try:
+        write_config = MCPWriteConfig(
+            broker_socket=socket_path,
+            allowed_subjects=("test-user",),
+        )
+        app = create_server(
+            data,
+            http_auth=config,
+            write_config=write_config,
+        ).streamable_http_app()
+
+        async def run_writable_smoke() -> None:
+            transport = httpx.ASGITransport(app=app)
+            async with app.router.lifespan_context(app):
+                async with httpx.AsyncClient(
+                    transport=transport,
+                    base_url="https://mcp.example.test",
+                ) as raw_client:
+                    metadata = await raw_client.get(
+                        "/.well-known/oauth-protected-resource/mcp"
+                    )
+                    assert metadata.status_code == 200
+                    assert metadata.json()["scopes_supported"] == [
+                        "homeops:read",
+                        "homeops:write",
+                    ]
+                    read_only = await raw_client.post(
+                        "/mcp",
+                        headers={
+                            "Authorization": "Bearer "
+                            + _access_token(signing_key)
+                        },
+                        json={"jsonrpc": "2.0", "id": 1, "method": "initialize"},
+                    )
+                    assert read_only.status_code == 403
+
+                headers = {
+                    "Authorization": "Bearer "
+                    + _access_token(
+                        signing_key,
+                        scope="openid homeops:read homeops:write",
+                    )
+                }
+                async with httpx.AsyncClient(
+                    transport=transport,
+                    base_url="https://mcp.example.test",
+                    headers=headers,
+                ) as http_client:
+                    async with streamable_http_client(
+                        RESOURCE_URL,
+                        http_client=http_client,
+                    ) as (read_stream, write_stream, _):
+                        async with ClientSession(read_stream, write_stream) as session:
+                            initialized = await session.initialize()
+                            assert "create-only capture_note" in initialized.instructions
+                            tools = await session.list_tools()
+                            by_name = {tool.name: tool for tool in tools.tools}
+                            assert set(by_name) == {
+                                "build_status",
+                                "capture_note",
+                                "context_bundle",
+                                "query",
+                                "write_status",
+                            }
+                            assert by_name["capture_note"].annotations is not None
+                            assert (
+                                by_name["capture_note"].annotations.readOnlyHint
+                                is False
+                            )
+                            assert (
+                                by_name["capture_note"].annotations.destructiveHint
+                                is False
+                            )
+                            assert by_name["write_status"].annotations is not None
+                            assert (
+                                by_name["write_status"].annotations.readOnlyHint is True
+                            )
+
+                            request_id = str(uuid.uuid4())
+                            captured = await session.call_tool(
+                                "capture_note",
+                                {
+                                    "request_id": request_id,
+                                    "title": "Cross-device capture",
+                                    "body": "Captured through the authenticated MCP.",
+                                    "categories": ["AI"],
+                                    "tags": ["remote"],
+                                },
+                            )
+                            assert captured.isError is False
+                            assert captured.structuredContent["outcome"] == "APPLIED"
+                            assert captured.structuredContent["publication"] == {
+                                "state": "pending",
+                                "active_run_id": active_state(data)["current"],
+                            }
+                            assert captured.structuredContent["obsidian_sync"] == {
+                                "state": "not-observed"
+                            }
+
+                            rebuild(vault, data)
+                            status = await session.call_tool(
+                                "write_status", {"request_id": request_id}
+                            )
+                            assert status.isError is False
+                            assert status.structuredContent["outcome"] == "APPLIED"
+                            assert (
+                                status.structuredContent["publication"]["state"]
+                                == "active"
+                            )
+                            assert status.structuredContent["obsidian_sync"] == {
+                                "state": "not-observed"
+                            }
+
+                denied_headers = {
+                    "Authorization": "Bearer "
+                    + _access_token(
+                        signing_key,
+                        subject="another-user",
+                        scope="openid homeops:read homeops:write",
+                    )
+                }
+                async with httpx.AsyncClient(
+                    transport=transport,
+                    base_url="https://mcp.example.test",
+                    headers=denied_headers,
+                ) as denied_client:
+                    async with streamable_http_client(
+                        RESOURCE_URL,
+                        http_client=denied_client,
+                    ) as (read_stream, write_stream, _):
+                        async with ClientSession(read_stream, write_stream) as session:
+                            await session.initialize()
+                            denied = await session.call_tool(
+                                "capture_note",
+                                {
+                                    "request_id": str(uuid.uuid4()),
+                                    "title": "Denied",
+                                    "body": "This must not be written.",
+                                    "categories": ["AI"],
+                                    "tags": [],
+                                },
+                            )
+                            assert denied.isError is True
+
+        anyio.run(run_writable_smoke)
+    finally:
+        broker_server.shutdown()
+        broker_server.server_close()
+        broker_thread.join(timeout=5)
+        broker.close()
+
+
+def test_write_configuration_fails_closed(tmp_path: Path) -> None:
+    with pytest.raises(MCPServerConfigurationError, match="authenticated"):
+        create_server(
+            tmp_path,
+            write_config=MCPWriteConfig(
+                broker_socket=tmp_path / "broker.sock",
+                allowed_subjects=("test-user",),
+            ),
+        )
+
+    base_arguments = {
+        "write_broker_socket": tmp_path / "broker.sock",
+        "write_subject": ["test-user"],
+        "write_scope": "homeops:write",
+        "write_timeout_seconds": 10.0,
+    }
+    with pytest.raises(MCPServerConfigurationError, match="use --unix-socket"):
+        _write_config_from_args(
+            SimpleNamespace(**base_arguments, unix_socket=None)
+        )
+    with pytest.raises(MCPServerConfigurationError, match="must be distinct"):
+        _write_config_from_args(
+            SimpleNamespace(
+                **base_arguments,
+                unix_socket=tmp_path / "broker.sock",
+            )
+        )
+
+    config, _ = _auth_material(tmp_path)
+    with pytest.raises(MCPServerConfigurationError, match="distinct"):
+        create_server(
+            tmp_path,
+            http_auth=config,
+            write_config=MCPWriteConfig(
+                broker_socket=tmp_path / "broker.sock",
+                allowed_subjects=("test-user",),
+                required_scope="homeops:read",
+            ),
+        )
 
 
 def test_unix_socket_is_private_and_non_socket_is_never_replaced(

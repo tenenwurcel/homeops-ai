@@ -1,4 +1,5 @@
 import re
+import uuid
 from collections import Counter, defaultdict, deque
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
@@ -186,6 +187,24 @@ def _canonical_current(client: Any, _: dict[str, str]) -> dict[str, Any]:
         if document["authority"] == "canonical" and document["status"] == "current"
     ]
     return _result(sorted(rows, key=lambda row: row["source_path"].casefold()))
+
+
+def _document_by_id(client: Any, params: dict[str, str]) -> dict[str, Any]:
+    document_id = params.get("document_id")
+    if not document_id:
+        raise QueryError("document-by-id requires parameter: document_id")
+    try:
+        parsed = uuid.UUID(document_id)
+    except (ValueError, AttributeError) as error:
+        raise QueryError("document-by-id requires a canonical UUID") from error
+    if str(parsed) != document_id:
+        raise QueryError("document-by-id requires a canonical UUID")
+    rows = [
+        document
+        for document in _documents(client)
+        if document["document_id"] == document_id
+    ]
+    return _result(rows)
 
 
 def _links_to(client: Any, params: dict[str, str]) -> dict[str, Any]:
@@ -457,6 +476,7 @@ def _context(client: Any, params: dict[str, str]) -> dict[str, Any]:
 QUERY_HANDLERS: dict[str, Callable[[Any, dict[str, str]], dict[str, Any]]] = {
     "canonical-current": _canonical_current,
     "context": _context,
+    "document-by-id": _document_by_id,
     "guidance-conflicts": _guidance_conflicts,
     "link-inventory": _link_inventory,
     "links-to": _links_to,

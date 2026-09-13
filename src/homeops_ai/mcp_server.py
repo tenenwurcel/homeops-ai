@@ -16,6 +16,7 @@ from urllib.parse import urlsplit
 
 import jwt
 import uvicorn
+from mcp.server.auth.middleware.auth_context import get_access_token
 from mcp.server.fastmcp import FastMCP
 from mcp.server.auth.provider import AccessToken, TokenVerifier
 from mcp.server.auth.settings import AuthSettings
@@ -32,6 +33,11 @@ from homeops_ai.query import (
     pinned_build_manifest,
     query_names,
 )
+from homeops_ai.write_broker import (
+    WriteBrokerClient,
+    WriteBrokerConfigurationError,
+    WriteBrokerError,
+)
 
 
 DEFAULT_DATA_DIR = Path("data")
@@ -43,14 +49,33 @@ MAX_HTTP_REQUEST_BYTES = 1024 * 1024
 JWT_ALGORITHM = "RS256"
 MIN_RSA_KEY_BITS = 2048
 MAX_RSA_KEY_BITS = 8192
-SERVER_INSTRUCTIONS = (
+READ_ONLY_SERVER_INSTRUCTIONS = (
     "Read-only access to a published HomeOps knowledge snapshot. Results are not "
     "live device discovery; inspect build_status provenance and freshness before "
     "treating them as current. Device control, shell execution, arbitrary queries, "
     "and infrastructure mutation are unavailable."
 )
+WRITABLE_SERVER_INSTRUCTIONS = (
+    "Read access uses only a published, verified HomeOps knowledge snapshot. "
+    "The create-only capture_note tool sends a bounded note to a separate local "
+    "vault broker; it never edits or deletes an existing note and never writes "
+    "directly to the derived Cozo database. Use a new UUIDv4 request_id, do not "
+    "submit secrets, and inspect write_status until publication becomes active. "
+    "Status is read-only; an accepted request that asks for a retry must be "
+    "resubmitted through capture_note with the same ID and content. "
+    "An active publication confirms the local verified build only; it does not "
+    "attest that Obsidian Sync has reached another device. "
+    "Results are not live device discovery, and device control, shell execution, "
+    "arbitrary queries, and infrastructure mutation remain unavailable."
+)
 READ_ONLY_ANNOTATIONS = ToolAnnotations(
     readOnlyHint=True,
+    destructiveHint=False,
+    idempotentHint=True,
+    openWorldHint=False,
+)
+CREATE_ANNOTATIONS = ToolAnnotations(
+    readOnlyHint=False,
     destructiveHint=False,
     idempotentHint=True,
     openWorldHint=False,
@@ -141,6 +166,51 @@ class HTTPAuthConfig:
                 raise MCPServerConfigurationError(
                     "allowed_origin must contain only scheme and authority"
                 )
+
+
+@dataclass(frozen=True)
+class MCPWriteConfig:
+    broker_socket: Path
+    allowed_subjects: tuple[str, ...]
+    required_scope: str = "homeops:write"
+    timeout_seconds: float = 10.0
+
+    def __post_init__(self) -> None:
+        if not self.broker_socket.is_absolute():
+            raise MCPServerConfigurationError("write broker socket must be absolute")
+        if (
+            not 1 <= len(self.required_scope) <= 256
+            or any(
+                ord(character) < 0x21
+                or ord(character) > 0x7E
+                or character in {'"', "\\"}
+                for character in self.required_scope
+            )
+        ):
+            raise MCPServerConfigurationError(
+                "write scope must be one non-empty OAuth scope"
+            )
+        if (
+            not self.allowed_subjects
+            or len(self.allowed_subjects) > 16
+            or len(set(self.allowed_subjects)) != len(self.allowed_subjects)
+        ):
+            raise MCPServerConfigurationError(
+                "write subjects must contain between 1 and 16 unique subjects"
+            )
+        if any(
+            not isinstance(subject, str)
+            or not 1 <= len(subject) <= 512
+            or any(ord(character) < 0x20 for character in subject)
+            for subject in self.allowed_subjects
+        ):
+            raise MCPServerConfigurationError("write subject is invalid")
+        try:
+            WriteBrokerClient(
+                self.broker_socket, timeout_seconds=self.timeout_seconds
+            )
+        except WriteBrokerConfigurationError as error:
+            raise MCPServerConfigurationError(str(error)) from error
 
 
 class OfflineJWKSTokenVerifier(TokenVerifier):
@@ -420,14 +490,77 @@ def compile_context_bundle(
         raise MCPToolError(str(error)) from error
 
 
+def _write_principal(config: MCPWriteConfig) -> tuple[str, str]:
+    access_token = get_access_token()
+    if (
+        access_token is None
+        or config.required_scope not in access_token.scopes
+        or access_token.subject not in config.allowed_subjects
+    ):
+        raise MCPToolError("write access is not authorized")
+    return access_token.subject, access_token.client_id
+
+
+def _publication_status(
+    data_dir: Path, response: dict[str, Any]
+) -> dict[str, Any]:
+    if response.get("outcome") != "APPLIED":
+        return response
+    document_id = response.get("document_id")
+    source_path = response.get("source_path")
+    publication: dict[str, Any] = {"state": "pending"}
+    try:
+        result = execute_query(
+            data_dir,
+            "document-by-id",
+            {"document_id": str(document_id)},
+        )
+        rows = result.get("rows", [])
+        if (
+            len(rows) == 1
+            and rows[0].get("document_id") == document_id
+            and rows[0].get("source_path") == source_path
+        ):
+            publication = {
+                "state": "active",
+                "run_id": result["run_id"],
+                "deployment": result["deployment"],
+            }
+        else:
+            publication = {
+                "state": "pending",
+                "active_run_id": result["run_id"],
+            }
+    except QueryError:
+        publication = {"state": "unavailable"}
+    return {
+        **response,
+        "publication": publication,
+        "obsidian_sync": {"state": "not-observed"},
+    }
+
+
 def create_server(
     data_dir: Path = DEFAULT_DATA_DIR,
     *,
     http_auth: HTTPAuthConfig | None = None,
+    write_config: MCPWriteConfig | None = None,
     host: str = "127.0.0.1",
     port: int = 8000,
 ) -> FastMCP:
     resolved_data_dir = data_dir.resolve()
+    if write_config is not None and http_auth is None:
+        raise MCPServerConfigurationError(
+            "write tools require authenticated Streamable HTTP"
+        )
+    if (
+        write_config is not None
+        and http_auth is not None
+        and write_config.required_scope == http_auth.required_scope
+    ):
+        raise MCPServerConfigurationError(
+            "read and write OAuth scopes must be distinct"
+        )
     token_verifier = None
     auth_settings = None
     transport_security = None
@@ -438,10 +571,13 @@ def create_server(
         allowed_origins = list(
             dict.fromkeys((resource_origin, *http_auth.allowed_origins))
         )
+        required_scopes = [http_auth.required_scope]
+        if write_config is not None:
+            required_scopes.append(write_config.required_scope)
         auth_settings = AuthSettings(
             issuer_url=http_auth.issuer_url,
             resource_server_url=http_auth.resource_url,
-            required_scopes=[http_auth.required_scope],
+            required_scopes=required_scopes,
         )
         transport_security = TransportSecuritySettings(
             enable_dns_rebinding_protection=True,
@@ -451,7 +587,11 @@ def create_server(
 
     mcp = FastMCP(
         "HomeOps AI",
-        instructions=SERVER_INSTRUCTIONS,
+        instructions=(
+            WRITABLE_SERVER_INSTRUCTIONS
+            if write_config is not None
+            else READ_ONLY_SERVER_INSTRUCTIONS
+        ),
         host=host,
         port=port,
         streamable_http_path="/mcp",
@@ -513,6 +653,62 @@ def create_server(
             run_id=run_id,
         )
 
+    if write_config is not None:
+        broker = WriteBrokerClient(
+            write_config.broker_socket,
+            timeout_seconds=write_config.timeout_seconds,
+        )
+
+        @mcp.tool(
+            title="Capture a new HomeOps note",
+            annotations=CREATE_ANNOTATIONS,
+        )
+        def capture_note(
+            request_id: str,
+            title: str,
+            body: str,
+            categories: list[str],
+            tags: list[str] | None = None,
+        ) -> dict[str, Any]:
+            """Create one supporting root note through the validated vault broker.
+
+            request_id must be a new canonical UUIDv4. Reusing it with the exact
+            same note is safe; reusing it with different content is rejected.
+            Categories must name existing vault categories. Never submit secrets.
+            This tool cannot edit, rename, or delete any existing note.
+            """
+            subject, client_id = _write_principal(write_config)
+            try:
+                response = broker.capture_note(
+                    request_id=request_id,
+                    subject=subject,
+                    client_id=client_id,
+                    title=title,
+                    body=body,
+                    categories=categories,
+                    tags=tags or [],
+                )
+            except WriteBrokerError as error:
+                raise MCPToolError(str(error)) from error
+            return _publication_status(resolved_data_dir, response)
+
+        @mcp.tool(
+            title="Check a HomeOps note write",
+            annotations=READ_ONLY_ANNOTATIONS,
+        )
+        def write_status(request_id: str) -> dict[str, Any]:
+            """Observe broker and verified-build status without retrying a write."""
+            subject, client_id = _write_principal(write_config)
+            try:
+                response = broker.write_status(
+                    request_id=request_id,
+                    subject=subject,
+                    client_id=client_id,
+                )
+            except WriteBrokerError as error:
+                raise MCPToolError(str(error)) from error
+            return _publication_status(resolved_data_dir, response)
+
     @mcp.custom_route("/healthz", methods=["GET"])
     async def healthz(_: Request) -> JSONResponse:
         return JSONResponse(
@@ -541,6 +737,10 @@ def add_mcp_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--jwks-file", type=Path)
     parser.add_argument("--required-scope", default="homeops:read")
     parser.add_argument("--allowed-origin", action="append", default=[])
+    parser.add_argument("--write-broker-socket", type=Path)
+    parser.add_argument("--write-scope", default="homeops:write")
+    parser.add_argument("--write-subject", action="append", default=[])
+    parser.add_argument("--write-timeout-seconds", type=float, default=10.0)
     parser.add_argument(
         "--check-config",
         action="store_true",
@@ -569,6 +769,35 @@ def _http_auth_from_args(args: argparse.Namespace) -> HTTPAuthConfig:
         jwks_file=args.jwks_file,
         required_scope=args.required_scope,
         allowed_origins=tuple(args.allowed_origin),
+    )
+
+
+def _write_config_from_args(args: argparse.Namespace) -> MCPWriteConfig | None:
+    if args.write_broker_socket is None:
+        if args.write_subject:
+            raise MCPServerConfigurationError(
+                "--write-subject requires --write-broker-socket"
+            )
+        return None
+    if not args.write_subject:
+        raise MCPServerConfigurationError(
+            "--write-broker-socket requires at least one --write-subject"
+        )
+    if args.unix_socket is None:
+        raise MCPServerConfigurationError(
+            "write tools require the MCP service to use --unix-socket"
+        )
+    if args.write_broker_socket.resolve(strict=False) == args.unix_socket.resolve(
+        strict=False
+    ):
+        raise MCPServerConfigurationError(
+            "MCP and write-broker Unix sockets must be distinct"
+        )
+    return MCPWriteConfig(
+        broker_socket=args.write_broker_socket,
+        allowed_subjects=tuple(args.write_subject),
+        required_scope=args.write_scope,
+        timeout_seconds=args.write_timeout_seconds,
     )
 
 
@@ -674,13 +903,19 @@ def run_server_from_args(args: argparse.Namespace) -> None:
             raise MCPServerConfigurationError(
                 "--check-config requires --transport streamable-http"
             )
+        if args.write_broker_socket is not None or args.write_subject:
+            raise MCPServerConfigurationError(
+                "write tools require --transport streamable-http"
+            )
         create_server(args.data_dir).run(transport="stdio")
         return
 
     http_auth = _http_auth_from_args(args)
+    write_config = _write_config_from_args(args)
     server = create_server(
         args.data_dir,
         http_auth=http_auth,
+        write_config=write_config,
         host=args.host,
         port=args.port,
     )
@@ -694,7 +929,7 @@ def run_server_from_args(args: argparse.Namespace) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run the read-only HomeOps MCP server")
+    parser = argparse.ArgumentParser(description="Run the HomeOps MCP server")
     add_mcp_arguments(parser)
     args = parser.parse_args()
 
