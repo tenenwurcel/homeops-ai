@@ -672,15 +672,39 @@ def test_authenticated_writable_http_requires_write_scope_and_subject(
                         "homeops:read",
                         "homeops:write",
                     ]
-                    read_only = await raw_client.post(
-                        "/mcp",
-                        headers={
-                            "Authorization": "Bearer "
-                            + _access_token(signing_key)
-                        },
-                        json={"jsonrpc": "2.0", "id": 1, "method": "initialize"},
-                    )
-                    assert read_only.status_code == 403
+                read_only_headers = {
+                    "Authorization": "Bearer " + _access_token(signing_key)
+                }
+                async with httpx.AsyncClient(
+                    transport=transport,
+                    base_url="https://mcp.example.test",
+                    headers=read_only_headers,
+                ) as read_only_client:
+                    async with streamable_http_client(
+                        RESOURCE_URL,
+                        http_client=read_only_client,
+                    ) as (read_stream, write_stream, _):
+                        async with ClientSession(read_stream, write_stream) as session:
+                            await session.initialize()
+                            tools = await session.list_tools()
+                            assert {tool.name for tool in tools.tools} == {
+                                "build_status",
+                                "capture_note",
+                                "context_bundle",
+                                "query",
+                                "write_status",
+                            }
+                            denied = await session.call_tool(
+                                "capture_note",
+                                {
+                                    "request_id": str(uuid.uuid4()),
+                                    "title": "Denied without write scope",
+                                    "body": "This must not be written.",
+                                    "categories": ["AI"],
+                                    "tags": [],
+                                },
+                            )
+                            assert denied.isError is True
 
                 headers = {
                     "Authorization": "Bearer "

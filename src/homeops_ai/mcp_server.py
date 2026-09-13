@@ -17,9 +17,13 @@ from urllib.parse import urlsplit
 import jwt
 import uvicorn
 from mcp.server.auth.middleware.auth_context import get_access_token
-from mcp.server.fastmcp import FastMCP
 from mcp.server.auth.provider import AccessToken, TokenVerifier
+from mcp.server.auth.routes import (
+    build_resource_metadata_url,
+    create_protected_resource_routes,
+)
 from mcp.server.auth.settings import AuthSettings
+from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import ToolAnnotations
 from starlette.requests import Request
@@ -96,6 +100,41 @@ class _UnixSocketUvicornServer(uvicorn.Server):
     @contextmanager
     def capture_signals(self) -> Generator[None, None, None]:
         yield
+
+
+class _HomeOpsFastMCP(FastMCP):
+    """Keep connection and tool authorization scopes independent."""
+
+    def __init__(
+        self,
+        *args: Any,
+        advertised_scopes: tuple[str, ...] = (),
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self._advertised_scopes = advertised_scopes
+
+    def streamable_http_app(self) -> Any:
+        app = super().streamable_http_app()
+        auth = self.settings.auth
+        if not self._advertised_scopes or auth is None or auth.resource_server_url is None:
+            return app
+
+        metadata_path = urlsplit(
+            str(build_resource_metadata_url(auth.resource_server_url))
+        ).path
+        replacement = create_protected_resource_routes(
+            resource_url=auth.resource_server_url,
+            authorization_servers=[auth.issuer_url],
+            scopes_supported=list(self._advertised_scopes),
+        )
+        app.router.routes = [
+            replacement[0]
+            if getattr(route, "path", None) == metadata_path
+            else route
+            for route in app.router.routes
+        ]
+        return app
 
 
 def _validate_https_url(
@@ -571,13 +610,10 @@ def create_server(
         allowed_origins = list(
             dict.fromkeys((resource_origin, *http_auth.allowed_origins))
         )
-        required_scopes = [http_auth.required_scope]
-        if write_config is not None:
-            required_scopes.append(write_config.required_scope)
         auth_settings = AuthSettings(
             issuer_url=http_auth.issuer_url,
             resource_server_url=http_auth.resource_url,
-            required_scopes=required_scopes,
+            required_scopes=[http_auth.required_scope],
         )
         transport_security = TransportSecuritySettings(
             enable_dns_rebinding_protection=True,
@@ -585,8 +621,17 @@ def create_server(
             allowed_origins=allowed_origins,
         )
 
-    mcp = FastMCP(
+    advertised_scopes = (
+        (http_auth.required_scope,)
+        if http_auth is not None
+        else ()
+    )
+    if write_config is not None:
+        advertised_scopes += (write_config.required_scope,)
+
+    mcp = _HomeOpsFastMCP(
         "HomeOps AI",
+        advertised_scopes=advertised_scopes,
         instructions=(
             WRITABLE_SERVER_INSTRUCTIONS
             if write_config is not None
