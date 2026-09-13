@@ -622,7 +622,7 @@ def test_authenticated_streamable_http_lists_and_calls_read_only_tools(
                             assert tool.annotations.destructiveHint is False
                             assert tool.annotations.openWorldHint is False
 
-                        result = await session.call_tool("build_status", {})
+                        result = await session.call_tool("homeops.build_status", {})
                         assert result.isError is False
                         assert result.structuredContent["result"] == "verified"
 
@@ -690,31 +690,12 @@ def test_authenticated_writable_http_requires_write_scope_and_subject(
                     base_url="https://mcp.example.test",
                     headers=read_only_headers,
                 ) as read_only_client:
-                    async with streamable_http_client(
-                        RESOURCE_URL,
-                        http_client=read_only_client,
-                    ) as (read_stream, write_stream, _):
-                        async with ClientSession(read_stream, write_stream) as session:
-                            await session.initialize()
-                            tools = await session.list_tools()
-                            assert {tool.name for tool in tools.tools} == {
-                                "build_status",
-                                "capture_note",
-                                "context_bundle",
-                                "query",
-                                "write_status",
-                            }
-                            denied = await session.call_tool(
-                                "capture_note",
-                                {
-                                    "request_id": str(uuid.uuid4()),
-                                    "title": "Denied without write scope",
-                                    "body": "This must not be written.",
-                                    "categories": ["AI"],
-                                    "tags": [],
-                                },
-                            )
-                            assert denied.isError is True
+                    denied = await read_only_client.post(
+                        "/mcp",
+                        json={"jsonrpc": "2.0", "id": 2, "method": "initialize"},
+                    )
+                    assert denied.status_code == 403
+                    assert denied.json()["error"] == "insufficient_scope"
 
                 headers = {
                     "Authorization": "Bearer "

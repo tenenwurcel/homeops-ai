@@ -85,7 +85,10 @@ CREATE_ANNOTATIONS = ToolAnnotations(
     openWorldHint=False,
 )
 OPENAI_CONNECTED_APP_TOOL_ALIASES = {
+    "homeops.build_status": "build_status",
     "homeops.capture_note": "capture_note",
+    "homeops.context_bundle": "context_bundle",
+    "homeops.query": "query",
     "homeops.write_status": "write_status",
 }
 
@@ -147,7 +150,7 @@ class _HomeOpsFastMCP(FastMCP):
     async def call_tool(
         self, name: str, arguments: dict[str, Any]
     ) -> Sequence[ContentBlock] | dict[str, Any]:
-        """Accept qualified write names emitted by OpenAI connected apps."""
+        """Accept qualified tool names emitted by OpenAI connected apps."""
         canonical_name = OPENAI_CONNECTED_APP_TOOL_ALIASES.get(name, name)
         return await super().call_tool(canonical_name, arguments)
 
@@ -653,10 +656,13 @@ def create_server(
         allowed_origins = list(
             dict.fromkeys((resource_origin, *http_auth.allowed_origins))
         )
+        connection_scopes = [http_auth.required_scope]
+        if write_config is not None:
+            connection_scopes.append(write_config.required_scope)
         auth_settings = AuthSettings(
             issuer_url=http_auth.issuer_url,
             resource_server_url=http_auth.resource_url,
-            required_scopes=[http_auth.required_scope],
+            required_scopes=connection_scopes,
         )
         transport_security = TransportSecuritySettings(
             enable_dns_rebinding_protection=True,
