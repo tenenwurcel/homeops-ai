@@ -179,3 +179,7 @@ def test_local_pipeline_records_invalid_evaluation_suite(tmp_path: Path) -> None
     assert result["retryable"] is False
     assert active_state(root / "data")["current_deployment"] is None
     assert (state / "last-result.json").is_file()
+
+    retry = _reconcile(vault, root, state)
+    assert retry["outcome"] == "PROMOTED"
+    assert verify_active(root)["outcome"] == "VERIFIED"

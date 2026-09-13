@@ -366,11 +366,12 @@ def reconcile_local(
                     )
                     try:
                         snapshot_dir = materialize_snapshot(root, exported, manifest)
+                        canonical_manifest = read_manifest(snapshot_dir / "snapshot.json")
                         built = rebuild(
                             snapshot_dir / "vault",
                             root / "data",
                             promote=False,
-                            snapshot_manifest=manifest,
+                            snapshot_manifest=canonical_manifest,
                             snapshot_received_at=utc_now(),
                             homeops_version=homeops_version,
                             source_revision=released_revision,
