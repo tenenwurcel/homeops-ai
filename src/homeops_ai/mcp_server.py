@@ -102,6 +102,32 @@ class _UnixSocketUvicornServer(uvicorn.Server):
         yield
 
 
+class _OAuthScopeChallenge:
+    def __init__(self, app: Any, scopes: tuple[str, ...]) -> None:
+        self._app = app
+        self._scope_parameter = f', scope="{" ".join(scopes)}"'.encode("ascii")
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        async def send_with_scopes(message: dict[str, Any]) -> None:
+            if message["type"] == "http.response.start":
+                message = {
+                    **message,
+                    "headers": [
+                        (
+                            name,
+                            value + self._scope_parameter
+                            if name.lower() == b"www-authenticate"
+                            and b"scope=" not in value.lower()
+                            else value,
+                        )
+                        for name, value in message.get("headers", [])
+                    ],
+                }
+            await send(message)
+
+        await self._app(scope, receive, send_with_scopes)
+
+
 class _HomeOpsFastMCP(FastMCP):
     """Keep connection and tool authorization scopes independent."""
 
@@ -134,6 +160,12 @@ class _HomeOpsFastMCP(FastMCP):
             else route
             for route in app.router.routes
         ]
+        for route in app.router.routes:
+            if getattr(route, "path", None) == self.settings.streamable_http_path:
+                endpoint = _OAuthScopeChallenge(route.app, self._advertised_scopes)
+                route.endpoint = endpoint
+                route.app = endpoint
+                break
         return app
 
 

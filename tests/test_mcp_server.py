@@ -562,6 +562,7 @@ def test_streamable_http_requires_oauth_and_serves_resource_metadata(
                 'resource_metadata="https://mcp.example.test/'
                 '.well-known/oauth-protected-resource/mcp"' in challenge
             )
+            assert 'scope="homeops:read"' in challenge
 
             malformed = await client.post(
                 "/mcp",
@@ -672,6 +673,15 @@ def test_authenticated_writable_http_requires_write_scope_and_subject(
                         "homeops:read",
                         "homeops:write",
                     ]
+                    unauthenticated = await raw_client.post(
+                        "/mcp",
+                        json={"jsonrpc": "2.0", "id": 1, "method": "initialize"},
+                    )
+                    assert unauthenticated.status_code == 401
+                    assert (
+                        'scope="homeops:read homeops:write"'
+                        in unauthenticated.headers["www-authenticate"]
+                    )
                 read_only_headers = {
                     "Authorization": "Bearer " + _access_token(signing_key)
                 }
