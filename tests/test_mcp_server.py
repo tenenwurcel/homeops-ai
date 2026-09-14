@@ -669,17 +669,14 @@ def test_authenticated_writable_http_requires_write_scope_and_subject(
                         "/.well-known/oauth-protected-resource/mcp"
                     )
                     assert metadata.status_code == 200
-                    assert metadata.json()["scopes_supported"] == [
-                        "homeops:read",
-                        "homeops:write",
-                    ]
+                    assert metadata.json()["scopes_supported"] == ["homeops:write"]
                     unauthenticated = await raw_client.post(
                         "/mcp",
                         json={"jsonrpc": "2.0", "id": 1, "method": "initialize"},
                     )
                     assert unauthenticated.status_code == 401
                     assert (
-                        'scope="homeops:read homeops:write"'
+                        'scope="homeops:write"'
                         in unauthenticated.headers["www-authenticate"]
                     )
                 read_only_headers = {
@@ -701,7 +698,7 @@ def test_authenticated_writable_http_requires_write_scope_and_subject(
                     "Authorization": "Bearer "
                     + _access_token(
                         signing_key,
-                        scope="openid homeops:read homeops:write",
+                        scope="openid homeops:write",
                     )
                 }
                 async with httpx.AsyncClient(

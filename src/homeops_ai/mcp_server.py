@@ -656,9 +656,11 @@ def create_server(
         allowed_origins = list(
             dict.fromkeys((resource_origin, *http_auth.allowed_origins))
         )
-        connection_scopes = [http_auth.required_scope]
-        if write_config is not None:
-            connection_scopes.append(write_config.required_scope)
+        connection_scopes = [
+            write_config.required_scope
+            if write_config is not None
+            else http_auth.required_scope
+        ]
         auth_settings = AuthSettings(
             issuer_url=http_auth.issuer_url,
             resource_server_url=http_auth.resource_url,
@@ -671,12 +673,12 @@ def create_server(
         )
 
     advertised_scopes = (
-        (http_auth.required_scope,)
-        if http_auth is not None
-        else ()
-    )
-    if write_config is not None:
-        advertised_scopes += (write_config.required_scope,)
+        (
+            write_config.required_scope
+            if write_config is not None
+            else http_auth.required_scope
+        ),
+    ) if http_auth is not None else ()
 
     mcp = _HomeOpsFastMCP(
         "HomeOps AI",
